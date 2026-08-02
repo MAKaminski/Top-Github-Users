@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rejouice-patterns": {
+      "type": "http",
+      "url": "https://rejouice-patterns.vercel.app/api/mcp"
+    }
+  }
+}

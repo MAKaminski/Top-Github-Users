@@ -1,0 +1,51 @@
+{
+  "total_count": 41628,
+  "incomplete_results": false,
+  "items": [
+    {
+      "login": "octoflow",
+      "id": 1428834,
+      "avatar_url": "https://avatars.githubusercontent.com/u/1428834?v=4",
+      "html_url": "https://github.com/octoflow",
+      "type": "User",
+      "site_admin": false,
+      "score": 1
+    },
+    {
+      "login": "mira-dev",
+      "id": 208813,
+      "avatar_url": "https://avatars.githubusercontent.com/u/208813?v=4",
+      "html_url": "https://github.com/mira-dev",
+      "type": "User",
+      "site_admin": false,
+      "score": 1
+    },
+    {
+      "login": "zeta-builds",
+      "id": 9930421,
+      "avatar_url": "https://avatars.githubusercontent.com/u/9930421?v=4",
+      "html_url": "https://github.com/zeta-builds",
+      "type": "User",
+      "site_admin": false,
+      "score": 1
+    },
+    {
+      "login": "release-bot-de",
+      "id": 77120044,
+      "avatar_url": "https://avatars.githubusercontent.com/u/77120044?v=4",
+      "html_url": "https://github.com/release-bot-de",
+      "type": "User",
+      "site_admin": false,
+      "score": 1
+    },
+    {
+      "login": "ghost-account",
+      "id": 30011,
+      "avatar_url": "https://avatars.githubusercontent.com/u/30011?v=4",
+      "html_url": "https://github.com/ghost-account",
+      "type": "User",
+      "site_admin": false,
+      "score": 1
+    }
+  ]
+}

@@ -1,0 +1,197 @@
+name: crawl
+
+# Tiered because places move at wildly different speeds and cost wildly
+# different amounts of rate limit. The worldwide board and the largest countries
+# earn a daily pass; the long tail of countries a weekly sweep, split into
+# alphabetical shards so one failing range does not lose the others; cities a
+# monthly one; organisations and repositories weekly.
+#
+# `github.event.schedule` is how one workflow tells its own crons apart — the
+# alternative is four near-identical files that drift out of step.
+
+on:
+  schedule:
+    # Off the hour: everything else in the world is scheduled on it, and GitHub
+    # queues scheduled runs accordingly.
+    - cron: "17 3 * * *" # daily   — worldwide + the largest countries
+    - cron: "43 4 * * 0" # weekly  — remaining countries, organisations, repositories
+    - cron: "11 5 1 * *" # monthly — cities
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: Tier to run
+        type: choice
+        default: worldwide
+        options: [worldwide, countries, cities, orgs, repos]
+      shard:
+        description: "Shard, as N/M — countries and cities only"
+        type: string
+        default: ""
+      limit:
+        description: Maximum places to crawl in this run
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  # Fails the workflow before anything writes. The crawler aborts on a missing
+  # token too, but by then a matrix leg has already spent five minutes on
+  # checkout and install — and a red job named for the reason is easier to act
+  # on than a stack trace in step six.
+  token:
+    name: crawl token present
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require GH_CRAWL_TOKEN
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: |
+          if [ -z "$GH_CRAWL_TOKEN" ]; then
+            echo "::error::GH_CRAWL_TOKEN is not set. Add a repository secret holding a GitHub" \
+                 "token with public read access. Refusing to run: an unauthenticated crawl" \
+                 "cannot reach the API and would commit an empty snapshot over good data."
+            exit 1
+          fi
+
+  worldwide:
+    needs: token
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'worldwide')
+    name: worldwide
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Crawl
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=worldwide ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      - name: Commit
+        run: .github/scripts/commit-data.sh worldwide
+
+  countries_daily:
+    needs: token
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'countries' && inputs.shard == '')
+    name: countries (daily set)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # No shard means the head of the country registry — the forty largest
+      # developer populations. See countryTargets() in scripts/crawler/index.ts.
+      - name: Crawl
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=countries ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      - name: Commit
+        run: .github/scripts/commit-data.sh countries-daily
+
+  countries_weekly:
+    needs: token
+    if: github.event.schedule == '43 4 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'countries' && inputs.shard != '')
+    name: countries ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      # One token means one 30-per-minute search budget. Legs running in
+      # parallel would spend the same allowance several times over and earn a
+      # secondary-rate-limit block; sharding here buys independent failure and
+      # independent commits, not concurrency.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        shard: ["1/6", "2/6", "3/6", "4/6", "5/6", "6/6"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Crawl
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=countries --shard=${{ matrix.shard }}
+      - name: Commit
+        run: .github/scripts/commit-data.sh "countries ${{ matrix.shard }}"
+
+  cities:
+    needs: token
+    if: github.event.schedule == '11 5 1 * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'cities')
+    name: cities ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        shard: ["1/4", "2/4", "3/4", "4/4"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Crawl
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=cities --shard=${{ matrix.shard }}
+      - name: Commit
+        run: .github/scripts/commit-data.sh "cities ${{ matrix.shard }}"
+
+  # Organisations are aggregated from the country boards on disk, so this has to
+  # follow the weekly sweep rather than run beside it. `always()` keeps the job
+  # reachable on a manual dispatch, where the sweep is skipped entirely.
+  orgs_repos:
+    needs: [token, countries_weekly]
+    if: |
+      always() && needs.token.result == 'success' && needs.countries_weekly.result != 'failure' &&
+      (github.event.schedule == '43 4 * * 0' ||
+       (github.event_name == 'workflow_dispatch' && (inputs.tier == 'orgs' || inputs.tier == 'repos')))
+    name: organisations and repositories
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Crawl organisations
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=orgs
+      - name: Crawl repositories
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=repos
+      - name: Commit
+        run: .github/scripts/commit-data.sh orgs-repos

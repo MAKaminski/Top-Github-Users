@@ -1,0 +1,50 @@
+{
+  "total_count": 88214,
+  "incomplete_results": false,
+  "items": [
+    {
+      "full_name": "freeCodeCamp/freeCodeCamp",
+      "description": "freeCodeCamp.org's open-source codebase and curriculum.",
+      "stargazers_count": 429118,
+      "forks_count": 41220,
+      "language": "TypeScript",
+      "owner": {
+        "login": "freeCodeCamp",
+        "avatar_url": "https://avatars.githubusercontent.com/u/9892522?v=4"
+      }
+    },
+    {
+      "full_name": "torvalds/linux",
+      "description": "Linux kernel source tree",
+      "stargazers_count": 201447,
+      "forks_count": 57310,
+      "language": "C",
+      "owner": {
+        "login": "torvalds",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1024025?v=4"
+      }
+    },
+    {
+      "full_name": "rust-lang/rust",
+      "description": "Empowering everyone to build reliable and efficient software.",
+      "stargazers_count": 108936,
+      "forks_count": 14022,
+      "language": "Rust",
+      "owner": {
+        "login": "rust-lang",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5430905?v=4"
+      }
+    },
+    {
+      "full_name": "sveltejs/svelte",
+      "description": null,
+      "stargazers_count": 84102,
+      "forks_count": 4611,
+      "language": "JavaScript",
+      "owner": {
+        "login": "sveltejs",
+        "avatar_url": "https://avatars.githubusercontent.com/u/23617963?v=4"
+      }
+    }
+  ]
+}

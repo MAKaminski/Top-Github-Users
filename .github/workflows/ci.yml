@@ -1,0 +1,40 @@
+name: ci
+
+# The site is built entirely from the committed data/ snapshot, so a crawl
+# commit is as capable of breaking the build as a code change is. Both go
+# through here.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: typecheck, test and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # Runs entirely on the recorded fixtures — no token, no network.
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
