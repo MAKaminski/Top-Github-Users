@@ -43,6 +43,7 @@ import {
   locationQuery,
   requireToken,
   GitHubClient,
+  GRAPHQL_BATCH_START,
   SEARCH_RESULT_CAP,
   type GitHubApi,
 } from "./github.ts";
@@ -924,6 +925,85 @@ class HydrationJournal {
   }
 }
 
+/**
+ * This snapshot's already-hydrated users, rebuilt from what is committed.
+ *
+ * The journal above lives under `data/discovery/`, which is gitignored — it
+ * survives a crash inside one job and nothing else. That was enough when a full
+ * pass was assumed to be half an hour. It is not enough now: 250,000 logins at
+ * the measured ten aliases a query is 25,000 points, and 5,000 points an hour
+ * makes the pass five hours of *budget* against a six-hour job ceiling. Being
+ * cut off is the normal case, so the run that follows has to start from what the
+ * last one committed rather than from zero.
+ *
+ * The committed board is that durable record. A full profile is restored where
+ * one exists — the top PROFILE_DEPTH, written whole — and below that a board
+ * entry carries everything any board, the search index or the API serves. What
+ * an entry does not carry is `bio` and `publicRepos`, and those are rendered
+ * only on a profile page, which by definition these logins do not have. They
+ * come back on the next unresumed pass.
+ *
+ * Returns nothing at all when the committed board is from an earlier snapshot:
+ * a new day is a new measurement, not a resume.
+ */
+async function restoreHydrated(context: Context): Promise<RankedUser[]> {
+  const restored: RankedUser[] = [];
+
+  for (let part = 1; ; part++) {
+    const file = part === 1 ? "worldwide.json" : `worldwide.${part}.json`;
+    const board = await readJsonFile<Leaderboard>(
+      path.join(context.dataDir, "leaderboard", file),
+    );
+    if (!board?.entries?.length) break;
+    if (board.generatedAt !== context.date) return [];
+
+    for (const entry of board.entries) {
+      const profile = entry.hasProfile
+        ? await readJsonFile<RankedUser>(
+            path.join(context.dataDir, "user", shardOf(entry.login), `${entry.login}.json`),
+          )
+        : null;
+      restored.push(profile ?? fromLeaderboardEntry(entry));
+    }
+  }
+
+  return restored;
+}
+
+/** The lossy direction of `toLeaderboardEntry`, for logins with no profile
+ *  file. Ranks are dropped deliberately — `assignRanks` recomputes them over
+ *  the merged set, and carrying yesterday's numbers in would be a lie. */
+export function fromLeaderboardEntry(entry: LeaderboardEntry): RankedUser {
+  return {
+    login: entry.login,
+    name: entry.name,
+    avatarUrl: entry.avatarUrl,
+    location: entry.location,
+    company: entry.company,
+    bio: null,
+    followers: entry.followers,
+    publicRepos: null,
+    contributions: {
+      total: entry.total,
+      public: entry.public,
+      private: entry.private,
+      commits: null,
+      pullRequests: null,
+      issues: null,
+      reviews: null,
+    },
+    calendar: null,
+    calendarSource: "estimated",
+    languages: [],
+    languageSource: "unavailable",
+    streak: null,
+    rank: { worldwide: null, country: null, city: null },
+    countryId: entry.countryId,
+    cityId: entry.cityId,
+    flagged: false,
+  };
+}
+
 interface CandidateFile {
   generatedAt: string;
   window: { hours: number; from: string; to: string };
@@ -1002,12 +1082,6 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
     );
   }
 
-  // §8: state the budget before spending any of it, and refuse a plan that
-  // cannot finish rather than starting one that will not.
-  const estimate = estimateBudget({ usersToHydrate: candidates.length, batchSize: 100 });
-  console.log(`\n${formatBudget(estimate)}\n`);
-  assertWithinBudget(estimate);
-
   const avatars = new Map(candidates.map((candidate) => [candidate.login, candidate.avatarUrl]));
   const window = contributionWindow(new Date(`${context.date}T00:00:00Z`));
 
@@ -1016,7 +1090,23 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
   // accumulate everything, write once at the end — meant any interruption threw
   // away the whole run's budget. This also keeps the heap bounded.
   const journal = new HydrationJournal(context.dataDir, context.date);
-  const done = await journal.open();
+  let done = await journal.open();
+
+  // Nothing on this runner, but the last run may have committed a board for the
+  // same snapshot before it ran out of clock. Seed the journal from it so the
+  // pass continues where that one stopped — and so `readAll` below republishes
+  // those users rather than dropping them.
+  if (done.size === 0) {
+    const restored = await restoreHydrated(context);
+    if (restored.length > 0) {
+      await journal.append(restored);
+      done = await journal.open();
+      console.log(
+        `Restored ${done.size.toLocaleString()} logins from the committed ${context.date} board`,
+      );
+    }
+  }
+
   if (done.size > 0) {
     console.log(`Resuming: ${done.size.toLocaleString()} logins already hydrated this snapshot`);
   }
@@ -1024,6 +1114,17 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
   const remaining = candidates
     .map((candidate) => candidate.login)
     .filter((login) => !done.has(login));
+
+  // §8: state the budget before spending any of it, and refuse a plan that
+  // cannot finish rather than starting one that will not. Stated *after* the
+  // journal is read, so a resumed run prints the work it actually has left
+  // rather than the work the first run started with.
+  const estimate = estimateBudget({
+    usersToHydrate: remaining.length,
+    batchSize: GRAPHQL_BATCH_START,
+  });
+  console.log(`\n${formatBudget(estimate)}\n`);
+  assertWithinBudget(estimate);
 
   const skipped: string[] = [];
   let batches = 0;
@@ -1047,7 +1148,7 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
 
       // One line per batch, as the standing rules require: this is the
       // smallest unit at which a run can be seen going wrong.
-      if (++batches % 25 === 0 || decoded.length === 0) {
+      if (++batches % 100 === 0 || decoded.length === 0) {
         console.log(
           `  batch ${String(batches).padStart(5)} · ${ranked.toLocaleString()} ranked · ` +
             `${skipped.length} unresolved`,
@@ -1202,12 +1303,15 @@ async function runCalendars(context: Context): Promise<void> {
 
   const logins = board.entries.slice(0, context.limit ?? PROFILE_DEPTH).map((entry) => entry.login);
 
-  // The calendar selection is heavier than the scalar one, so its cost is
-  // assumed high here and the run reports what it actually measured. If the
-  // measurement lands above this, narrow the depth rather than running longer.
+  // The calendar selection is heavier than the scalar one — 371 day nodes per
+  // login on top of the aggregation the scalar pass already found to be the
+  // binding cost — so it starts below the measured scalar ceiling and the
+  // ladder finds the rest. Cost is assumed high here and the run reports what
+  // it actually measured; if the measurement lands above this, narrow the depth
+  // rather than running longer.
   const estimate = estimateBudget({
     usersToHydrate: logins.length,
-    batchSize: 25,
+    batchSize: Math.ceil(GRAPHQL_BATCH_START / 2),
     observedCostPerQuery: 5,
   });
   console.log(`\n${formatBudget(estimate)}\n`);
@@ -1505,7 +1609,10 @@ async function runDiscovery(context: Context, options: Options): Promise<void> {
   );
 
   // §8: state the budget before any hydration is attempted.
-  const estimate = estimateBudget({ usersToHydrate: candidates.length, batchSize: 100 });
+  const estimate = estimateBudget({
+    usersToHydrate: candidates.length,
+    batchSize: GRAPHQL_BATCH_START,
+  });
   console.log(`\n${formatBudget(estimate)}`);
   assertWithinBudget(estimate);
 

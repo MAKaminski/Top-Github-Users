@@ -28,10 +28,11 @@ import {
   assignRanks,
   AUTOMATION_THRESHOLD,
   languagesFrom,
+  toLeaderboardEntry,
   toRankedUser,
 } from "./transform.ts";
 import { appendSnapshot, applyRetention, updateHistory } from "./history.ts";
-import { needsToken, parseOptions, run, selectShard } from "./index.ts";
+import { fromLeaderboardEntry, needsToken, parseOptions, run, selectShard } from "./index.ts";
 import { emptyState, writeState } from "./state.ts";
 
 const GERMANY = COUNTRY_BY_SLUG.get("germany")!;
@@ -417,6 +418,10 @@ test("the batch ladder walks all the way down to the client's own floor", async 
   let clock = 0;
   const client = new GitHubClient({
     token: "t",
+    // One worker, so the rungs are a sequence rather than six overlapping ones.
+    // The stampede guard is what the concurrent case relies on, and it has a
+    // test of its own below.
+    concurrency: 1,
     sleepImpl: async (ms) => {
       clock += ms;
     },
@@ -443,9 +448,70 @@ test("the batch ladder walks all the way down to the client's own floor", async 
   const rungs = sizes.filter((size, i) => size !== sizes[i - 1]);
   assert.deepEqual(
     rungs.slice(0, 5),
-    [100, 50, 25, 10, 5],
+    [10, 5, 3, 2, 1],
     "the first batch walks every rung before being given up on",
   );
+});
+
+test("a rung that fails under six workers steps down once, not six times", async () => {
+  // Every worker in flight fails at roughly the same moment on a size GitHub
+  // will not serve. Letting each of them step would take a single bad rung
+  // straight to the floor, and the run would spend the rest of the corpus
+  // paying ten queries for what ten aliases would have answered in one.
+  const sizes: number[] = [];
+  let clock = 0;
+  const client = new GitHubClient({
+    token: "t",
+    concurrency: 6,
+    sleepImpl: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit).body)) as {
+        variables: Record<string, string>;
+      };
+      const aliases = Object.keys(body.variables).filter((k) => k !== "from" && k !== "to");
+      sizes.push(aliases.length);
+      // 10 is unservable; everything below it is fine.
+      if (aliases.length > 5) return new Response("gateway", { status: 502 });
+      return Response.json({
+        data: {
+          rateLimit: { cost: 1, limit: 5000, remaining: 4999, resetAt: "", nodeCount: 1 },
+          ...Object.fromEntries(
+            aliases.map((alias) => [
+              alias,
+              {
+                login: body.variables[alias],
+                name: null,
+                avatarUrl: "",
+                location: null,
+                company: null,
+                bio: null,
+                followers: { totalCount: 1 },
+                repositories: { totalCount: 1 },
+                contributionsCollection: {
+                  totalCommitContributions: 1,
+                  totalPullRequestContributions: 0,
+                  totalIssueContributions: 0,
+                  totalPullRequestReviewContributions: 0,
+                  restrictedContributionsCount: 0,
+                  contributionCalendar: { totalContributions: 1 },
+                },
+              },
+            ]),
+          ),
+        },
+      });
+    },
+  });
+
+  const logins = Array.from({ length: 120 }, (_, i) => `dev${i}`);
+  const result = await client.enrichUsers(logins, { from: "a", to: "b" }, { calendar: false });
+
+  assert.equal(client.batchSize, 5, "one rung down from 10, not five rungs down to 1");
+  assert.ok(!sizes.includes(3), "the ladder never reached the rung below the working one");
+  assert.equal(result.users.length, 120, "and every login was still hydrated");
 });
 
 test("a batch nobody can serve is dead-lettered, and the run carries on", async () => {
@@ -594,6 +660,28 @@ test("the probe reports a size as working only when every alias comes back", asy
     2,
     "a failing size is tried twice, not eight times",
   );
+});
+
+test("a board entry round-trips back to everything a board can serve", async () => {
+  // The resume path rebuilds unprofiled users from the committed board, so this
+  // conversion is load-bearing: a field added to LeaderboardEntry and forgotten
+  // here would silently blank that column for every user restored after a
+  // hydration run was cut off. Round-tripping is what notices.
+  const { users } = await crawlFixtures();
+  const original = toLeaderboardEntry(users[0], 7, { previousRank: 3, hasProfile: true });
+  const restored = toLeaderboardEntry(fromLeaderboardEntry(original), 7, {
+    previousRank: 3,
+    hasProfile: true,
+  });
+
+  assert.deepEqual(restored, original);
+
+  // And the two fields that genuinely do not survive are the two a profile page
+  // renders — which a restored-from-entry user does not have.
+  const lossy = fromLeaderboardEntry(original);
+  assert.equal(lossy.bio, null);
+  assert.equal(lossy.publicRepos, null);
+  assert.equal(lossy.rank.worldwide, null, "yesterday's rank is not carried forward");
 });
 
 test("a user hydrated without days gets no calendar rather than an empty one", () => {

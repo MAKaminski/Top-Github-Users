@@ -15,6 +15,17 @@ on:
     # queues scheduled runs accordingly.
     - cron: "5 */6 * * *" # 6-hourly — GH Archive discovery (no API budget)
     - cron: "17 3 * * *" # daily   — hydrate the discovered corpus, then calendars
+    # Resume slots, same UTC day as the daily pass above.
+    #
+    # 250,000 logins at ten aliases a query is 25,000 points, and the free
+    # ceiling is 5,000 an hour — so a full pass is five hours of *budget* no
+    # matter how fast the network is, and a six-hour job ceiling leaves no
+    # margin for a slow start or an hour lost to backoff. The hydration journal
+    # is keyed by snapshot date and skips what it already has, so these two
+    # simply carry on. Both are no-ops once the corpus is complete: every login
+    # is in the journal, and the run costs a checkout.
+    - cron: "17 9 * * *" # daily   — resume hydration if the 03:17 pass ran out of clock
+    - cron: "17 15 * * *" # daily   — second resume, same snapshot date
     - cron: "43 4 * * 0" # weekly  — remaining countries, organisations, repositories
     - cron: "11 5 1 * *" # monthly — cities
   workflow_dispatch:
@@ -35,6 +46,17 @@ on:
 
 permissions:
   contents: write
+
+# One crawl at a time, and never cancel one that is running.
+#
+# Both halves matter. Two hydrate runs overlapping would hold two views of the
+# same journal and spend the hour's budget twice on the same logins, then race
+# to commit; and `cancel-in-progress: true` would let the 09:17 resume kill the
+# 03:17 pass it exists to continue. Queueing is the correct behaviour here —
+# a resume that starts late still resumes.
+concurrency:
+  group: crawl
+  cancel-in-progress: false
 
 jobs:
   # Fails the workflow before anything writes. The crawler aborts on a missing
@@ -57,13 +79,15 @@ jobs:
           fi
 
   # A standalone diagnostic, cheap enough to run whenever the API is behaving
-  # strangely: one point for the viewer check, one or two more for a SINGLE-user
-  # enrichment using the exact selection hydration sends. No discovery in front
-  # of it, so it answers in under a minute instead of after a 3.5 GB download.
+  # strangely: one point for the viewer check, then one per probed alias count
+  # using the exact selection hydration sends. It reports the largest count
+  # GitHub will serve and the schedule that follows from it — the number the
+  # whole hydration plan rests on, and one that moves. No discovery in front of
+  # it, so it answers in under a minute instead of after a 3.5 GB download.
   verify:
     needs: token
     if: github.event_name == 'workflow_dispatch' && inputs.tier == 'verify'
-    name: verify (token and a one-user enrichment)
+    name: verify (token and the alias ceiling)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -104,17 +128,25 @@ jobs:
         run: .github/scripts/commit-data.sh discover
 
   # The main pass. Reads the candidate list discovery already wrote and turns it
-  # into every board, at 100 aliases a GraphQL query. Scalars only: the
-  # day-by-day calendar is 371 nodes per login and belongs to the job below.
+  # into every board, at ten aliases a GraphQL query — the measured ceiling for
+  # a query carrying `contributionsCollection`; see the verify job. Scalars
+  # only: the day-by-day calendar is 371 nodes per login and belongs to the job
+  # below.
   hydrate:
     needs: token
-    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'hydrate')
+    if: >-
+      github.event.schedule == '17 3 * * *' ||
+      github.event.schedule == '17 9 * * *' ||
+      github.event.schedule == '17 15 * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.tier == 'hydrate')
     name: hydrate (scalars, whole corpus)
     runs-on: ubuntu-latest
-    # Well inside the 6-hour job ceiling: the printed budget refuses anything
-    # that cannot finish, so a timeout here means the estimate was wrong, which
-    # is worth failing loudly for.
-    timeout-minutes: 300
+    # Just inside the 6-hour hosted-runner ceiling. A full corpus is five hours
+    # of rate-limit budget on its own, so this job is expected to run long and
+    # occasionally to be cut off — which is what the resume crons and the
+    # journal are for. The printed budget still refuses a plan that cannot
+    # finish at all.
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
         with:

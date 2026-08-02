@@ -34,40 +34,68 @@ const SEARCH_REQUESTS_PER_MINUTE = 30;
 /**
  * Alias batching.
  *
- * The standing rules are explicit: start at 100 and halve to 50 then 25 on a
- * query timeout. 100 aliases is a single point for a hundred profiles, which is
- * the whole reason hydration is affordable — at 25 we were paying four times
- * over for the same work.
+ * CLAUDE.md §1 says to start at 100 and halve on timeout, because 100 aliases
+ * cost a single point. The *points* part is true — a ten-alias query bills 1,
+ * same as a one-alias query — but 100 is unreachable for this selection, and
+ * the reason is not the rate limit at all.
+ *
+ * `contributionsCollection` makes GitHub aggregate a year of events per alias
+ * inside one query's execution budget, and that budget is what runs out. The
+ * `verify` tier measures the ceiling directly (see PROBE_SIZES in index.ts).
+ * Measured 2026-08-02, on a personal token:
+ *
+ *     1 alias   cost 1   0.5s   ok
+ *     2         cost 1   0.9s   ok
+ *     3         cost 1   1.3s   ok
+ *     5         cost 1   2.0s   ok
+ *    10         cost 1   3.4s   ok
+ *    25         —        7.0s   "Resource limits for this query exceeded."
+ *
+ * So: 10, and re-measure with `--tier=verify` rather than assuming it held.
+ * Note the shape of the failure at 25 — a structured GraphQL error naming the
+ * reason, not the gateway 502 an earlier run took at every size. Those 502s
+ * were GitHub being unwell, and reading them as a hard ceiling was wrong.
  *
  * The ladder is for TIMEOUTS specifically. Measured `rateLimit.cost` separately
  * shrinks the batch when a selection turns out heavier than expected; the two
  * mechanisms answer different failures and both are needed.
  */
-export const GRAPHQL_BATCH_START = 100;
-const GRAPHQL_BATCH_MIN = 5;
-const GRAPHQL_BATCH_MAX = 100;
+export const GRAPHQL_BATCH_START = 10;
+const GRAPHQL_BATCH_MIN = 1;
+const GRAPHQL_BATCH_MAX = 10;
 /**
- * Halved in order on timeout, per the rules — down to the floor the client
- * itself supports.
+ * Walked down in order on timeout, to the floor the client itself supports.
  *
  * It used to stop at 25 while `GRAPHQL_BATCH_MIN` was 5, so a batch that could
  * not be served at 25 gave up with three viable sizes untried. That is not
  * hypothetical: a real run took fifteen consecutive 502/504s walking
  * 100 -> 50 -> 25 and then threw, losing 250,000 users of work.
  *
- * The floor matters because `contributionsCollection` is priced by GitHub's
- * query executor rather than by the node count we can see, and an over-budget
- * query comes back as a gateway 502 rather than a structured error. Walking
- * down is the only way to find the ceiling.
+ * The floor is 1 because a single pathological account — someone with an
+ * enormous year — can exceed the executor's budget on its own. At size 1 there
+ * is nothing left to blame but that account, and it gets dead-lettered.
  */
-const GRAPHQL_BATCH_LADDER = [100, 50, 25, 10, 5] as const;
-/** Points we are willing to spend per enrichment request. One point per
- *  hundred logins is the documented shape; anything above that is a signal the
- *  selection grew, not a budget to spend. */
+const GRAPHQL_BATCH_LADDER = [10, 5, 3, 2, 1] as const;
+/** Points we are willing to spend per enrichment request. Every batch size we
+ *  can actually use bills 1, so this is a tripwire for the selection growing,
+ *  not a budget to spend. */
 const GRAPHQL_TARGET_COST = 1;
 /** Below this many points left in the hour, wait for the reset rather than
  *  burning the remainder and having the run die mid-place. */
 const GRAPHQL_RESERVE = 200;
+
+/**
+ * Enrichment requests in flight.
+ *
+ * §4: 4–8, never higher. It does not raise the 5,000-point ceiling — it is what
+ * lets a run reach it. A ten-alias query takes ~3.4s, so a single-threaded pass
+ * hydrates ~10,600 users an hour against a budget that allows 50,000; five
+ * sixths of the wall clock would be spent waiting on the socket. Six workers
+ * put the two roughly in line, and `adaptBatchSize` still parks the whole pool
+ * when the hourly points run low.
+ */
+const CONCURRENCY = 6;
+const MAX_CONCURRENCY = 8;
 
 const MAX_ATTEMPTS = 5;
 
@@ -543,6 +571,10 @@ export interface ClientOptions {
   /** Where a unit of work goes when it cannot be served at any batch size.
    *  Omit and such a batch is dropped with a log line but no record. */
   deadLetter?: DeadLetterSink;
+  /** Enrichment requests in flight at once. §4 allows 4–8 and the constructor
+   *  clamps to that; higher does not raise the ceiling, it just earns a
+   *  secondary-limit block. Tests set 1 to keep batch order deterministic. */
+  concurrency?: number;
   /** Injected so a test can exercise the retry and batch-ladder paths without
    *  actually waiting out the backoff. Production never sets it — and when a
    *  test replaces `sleepImpl`, `now` has to advance with it or the wall-clock
@@ -575,6 +607,7 @@ export class GitHubClient implements GitHubApi {
   log: (message: string) => void;
   searchLimiter: TokenBucket;
   batchSize: number;
+  concurrency: number;
 
   constructor(options: ClientOptions) {
     this.token = options.token;
@@ -587,6 +620,10 @@ export class GitHubClient implements GitHubApi {
     this.log = options.log ?? (() => {});
     this.searchLimiter = new TokenBucket(SEARCH_REQUESTS_PER_MINUTE);
     this.batchSize = GRAPHQL_BATCH_START;
+    // Clamped rather than trusted: §4's ceiling is 8, and a caller passing 32
+    // would trade the whole run for a secondary-limit block. 1 stays reachable
+    // because tests need batches to complete in a known order.
+    this.concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, options.concurrency ?? CONCURRENCY));
   }
 
   /**
@@ -761,93 +798,120 @@ export class GitHubClient implements GitHubApi {
     let dropped = 0;
     let consecutiveDrops = 0;
 
-    for (let index = 0; index < logins.length; ) {
-      const batch = logins.slice(index, index + this.batchSize);
-      index += batch.length;
+    // Shared work state. `cursor` walks the corpus; `requeued` holds logins
+    // from a batch that has to be reissued at a smaller size, and is drained
+    // first so a stepped-down rung is retried promptly rather than at the end.
+    let cursor = 0;
+    const requeued: string[] = [];
+    let journal = Promise.resolve();
 
-      const variables: Record<string, string> = { from: window.from, to: window.to };
-      batch.forEach((login, position) => {
-        variables[aliasFor(position)] = login;
-      });
+    const takeBatch = (): string[] | null => {
+      if (requeued.length) return requeued.splice(0, this.batchSize);
+      if (cursor >= logins.length) return null;
+      const batch = logins.slice(cursor, cursor + this.batchSize);
+      cursor += batch.length;
+      return batch;
+    };
 
-      let body: GraphQLBody;
-      try {
-        body = (await this.request(GRAPHQL_ENDPOINT, {
-          method: "POST",
-          body: JSON.stringify({
-            query: buildUserQuery(batch.length, {
-              languages: options.languages ?? this.languages,
-              calendar: options.calendar,
+    const worker = async (): Promise<void> => {
+      for (let batch = takeBatch(); batch !== null; batch = takeBatch()) {
+        // Captured before the request so a concurrent worker stepping the
+        // ladder down mid-flight cannot make this batch look stale.
+        const sizeSent = this.batchSize;
+
+        const variables: Record<string, string> = { from: window.from, to: window.to };
+        batch.forEach((login, position) => {
+          variables[aliasFor(position)] = login;
+        });
+
+        let body: GraphQLBody;
+        try {
+          body = (await this.request(GRAPHQL_ENDPOINT, {
+            method: "POST",
+            body: JSON.stringify({
+              query: buildUserQuery(batch.length, {
+                languages: options.languages ?? this.languages,
+                calendar: options.calendar,
+              }),
+              variables,
             }),
-            variables,
-          }),
-        })) as GraphQLBody;
-      } catch (error) {
-        // A timeout is not a reason to fail the tier — it is the signal to
-        // halve. Rewind so the same logins are retried at the smaller size;
-        // a smaller batch is cheaper than a retry at the same size.
-        if (isTimeout(error) && this.stepBatchSizeDown()) {
-          index -= batch.length;
-          this.log(`GraphQL timed out; halving batch to ${this.batchSize}`);
-          continue;
-        }
-        if (!isTimeout(error)) throw error;
+          })) as GraphQLBody;
+        } catch (error) {
+          // A timeout is not a reason to fail the tier — it is the signal to
+          // step down. Requeue the logins so they are retried at the smaller
+          // size; a smaller batch is cheaper than a retry at the same size.
+          if (isOversized(error) && this.stepDownFrom(sizeSent)) {
+            requeued.unshift(...batch);
+            continue;
+          }
+          if (!isOversized(error)) throw error;
 
-        // Bottom of the ladder. §4: never retry a unit of work more than five
-        // times — write it to the dead-letter file and move on. Throwing here
-        // would discard every batch already hydrated, which is how a run that
-        // had collected nothing yet still managed to lose 250,000 users.
-        await this.deadLetter?.record(
-          `enrich:${batch[0]}..${batch[batch.length - 1]}`,
-          error instanceof Error ? error.message : String(error),
-          GRAPHQL_BATCH_LADDER.length,
-        );
-        dropped += batch.length;
-        consecutiveDrops++;
-
-        if (consecutiveDrops >= MAX_CONSECUTIVE_DEAD_LETTERS) {
-          throw new Error(
-            `GraphQL served none of the last ${consecutiveDrops} batches at any size ` +
-              `(${GRAPHQL_BATCH_LADDER.join(", ")}). Treating this as an outage rather than ` +
-              `dead-lettering the remaining ${logins.length - index} logins. ` +
-              `Last error: ${error instanceof Error ? error.message : String(error)}`,
+          // Bottom of the ladder. §4: never retry a unit of work more than five
+          // times — write it to the dead-letter file and move on. Throwing here
+          // would discard every batch already hydrated, which is how a run that
+          // had collected nothing yet still managed to lose 250,000 users.
+          await this.deadLetter?.record(
+            `enrich:${batch[0]}..${batch[batch.length - 1]}`,
+            error instanceof Error ? error.message : String(error),
+            GRAPHQL_BATCH_LADDER.length,
           );
-        }
+          dropped += batch.length;
+          consecutiveDrops++;
 
-        this.log(
-          `batch of ${batch.length} unserved at every batch size; dead-lettered ` +
-            `(${dropped} logins dropped so far) and continuing`,
-        );
-        this.resetBatchSize();
-        continue;
-      }
+          if (consecutiveDrops >= MAX_CONSECUTIVE_DEAD_LETTERS) {
+            throw new Error(
+              `GraphQL served none of the last ${consecutiveDrops} batches at any size ` +
+                `(${GRAPHQL_BATCH_LADDER.join(", ")}). Treating this as an outage rather than ` +
+                `dead-lettering the remaining ${logins.length - cursor + requeued.length} logins. ` +
+                `Last error: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
 
-      const fatal = fatalGraphQlError(body);
-      if (fatal) {
-        if (/timeout/i.test(fatal) && this.stepBatchSizeDown()) {
-          index -= batch.length;
-          this.log(`GraphQL reported a timeout; halving batch to ${this.batchSize}`);
+          this.log(
+            `batch of ${batch.length} unserved at every batch size; dead-lettered ` +
+              `(${dropped} logins dropped so far) and continuing`,
+          );
+          this.resetBatchSize();
           continue;
         }
-        throw new Error(`GraphQL enrichment failed: ${fatal}`);
+
+        const fatal = fatalGraphQlError(body);
+        if (fatal) {
+          if (isOversized(fatal) && this.stepDownFrom(sizeSent)) {
+            requeued.unshift(...batch);
+            continue;
+          }
+          throw new Error(`GraphQL enrichment failed: ${fatal}`);
+        }
+
+        consecutiveDrops = 0;
+
+        const decoded = decodeGraphQlUsers(body, batch);
+        // With a per-batch consumer the caller owns the records and this method
+        // holds nothing: that is what lets a 250,000-login pass run in bounded
+        // memory and resume from where it stopped.
+        if (collect) {
+          users.push(...decoded.users);
+          skipped.push(...decoded.skipped);
+        } else {
+          // Serialised, unlike the requests. The consumer appends to a journal
+          // file, and interleaved appends from six workers would corrupt the
+          // very thing that makes the run resumable.
+          const index = batchIndex;
+          journal = journal.then(() => options.onBatch?.({ ...decoded, index }));
+          await journal;
+        }
+        batchIndex++;
+
+        await this.adaptBatchSize(rateLimitFrom(body), batch.length);
       }
+    };
 
-      consecutiveDrops = 0;
-
-      const decoded = decodeGraphQlUsers(body, batch);
-      // With a per-batch consumer the caller owns the records and this method
-      // holds nothing: that is what lets a 250,000-login pass run in bounded
-      // memory and resume from where it stopped.
-      if (collect) {
-        users.push(...decoded.users);
-        skipped.push(...decoded.skipped);
-      } else {
-        await options.onBatch?.({ ...decoded, index: batchIndex });
-      }
-      batchIndex++;
-
-      await this.adaptBatchSize(rateLimitFrom(body), batch.length);
-    }
+    // Concurrency does not raise the 5,000-point ceiling; it is what lets us
+    // reach it. A ten-alias query takes ~3.4s, so one worker hydrates ~10,600
+    // users an hour against a budget that allows 50,000 — the run would spend
+    // five sixths of its wall clock waiting on the socket. §4 caps this at 8.
+    await Promise.all(Array.from({ length: this.concurrency }, () => worker()));
 
     if (dropped > 0) {
       this.log(`${dropped} logins were never served and are listed in the dead-letter file`);
@@ -868,14 +932,21 @@ export class GitHubClient implements GitHubApi {
   }
 
   /**
-   * Walk down the 100 -> 50 -> 25 ladder. Returns false at the bottom, so a
-   * genuine failure still surfaces instead of looping forever on a batch size
-   * that was never the problem.
+   * Walk down the 10 -> 5 -> 3 -> 2 -> 1 ladder. Returns false at the bottom,
+   * so a genuine failure still surfaces instead of looping forever on a batch
+   * size that was never the problem.
+   *
+   * `sentAt` is the size the failing batch was issued at. With several workers
+   * in flight they all fail at roughly the same moment on a rung that is too
+   * big, and letting each of them step would drop the ladder to its floor on
+   * the strength of one bad rung. Only the first report moves it.
    */
-  private stepBatchSizeDown(): boolean {
+  private stepDownFrom(sentAt: number): boolean {
+    if (this.batchSize < sentAt) return true; // another worker already stepped down
     const next = GRAPHQL_BATCH_LADDER.find((size) => size < this.batchSize);
     if (next === undefined) return false;
     this.batchSize = next;
+    this.log(`GraphQL could not serve ${sentAt} aliases; batch now ${next}`);
     return true;
   }
 
@@ -988,11 +1059,17 @@ export class GitHubClient implements GitHubApi {
   }
 }
 
-/** GitHub reports query timeouts inconsistently — as a 502, as a plain socket
- *  timeout, or as a GraphQL error naming it. Match all three. */
-export function isTimeout(error: unknown): boolean {
+/**
+ * "This query asked for too much" — the one failure the batch ladder answers.
+ *
+ * GitHub reports it four ways: a 502, a 504, a plain socket timeout, and a
+ * structured `Resource limits for this query exceeded.` The last is the polite
+ * one, and it is what a 25-alias `contributionsCollection` query actually
+ * returns; missing it meant an over-sized batch threw instead of stepping down.
+ */
+export function isOversized(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /timeout|timed out|ETIMEDOUT|502|504/i.test(message);
+  return /timeout|timed out|ETIMEDOUT|502|504|resource limits/i.test(message);
 }
 
 /** The trailing year the contribution calendar covers, ending on `date`. */
