@@ -23,7 +23,7 @@
  * in `data/_state.json`, and the next run resumes from there — see state.ts.
  */
 
-import { readFile, readdir } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { writeJson, DATA_DIR } from "../lib/io.ts";
@@ -66,6 +66,7 @@ import {
 } from "./state.ts";
 import { discover, filterCandidates, recentHours } from "./gharchive.ts";
 import { assertWithinBudget, estimateBudget, formatBudget } from "./budget.ts";
+import { DeadLetter } from "./limiter.ts";
 
 /**
  * Board depths.
@@ -822,6 +823,60 @@ async function writeFlagged(context: Context, found: RankedUser[]): Promise<numb
 
 // ---- Hydration ------------------------------------------------------------
 
+/**
+ * Append-only record of a hydration pass, so an interrupted run resumes.
+ *
+ * JSON Lines rather than a JSON array: a crash mid-write costs the last line
+ * instead of the whole file, and appending does not require reading back what
+ * is already there. It lives under `data/discovery/`, which is gitignored — it
+ * is an intermediate, not a snapshot, and the boards derived from it are what
+ * get committed.
+ *
+ * Keyed by snapshot date: a run on a new day starts a fresh journal rather than
+ * resuming into yesterday's contribution window.
+ */
+class HydrationJournal {
+  private readonly file: string;
+
+  constructor(dataDir: string, date: string) {
+    this.file = path.join(dataDir, "discovery", `hydrated-${date}.jsonl`);
+  }
+
+  /** Logins already recorded for this snapshot. */
+  async open(): Promise<Set<string>> {
+    const logins = new Set<string>();
+    for (const user of await this.readAll()) logins.add(user.login);
+    return logins;
+  }
+
+  async append(users: RankedUser[]): Promise<void> {
+    if (users.length === 0) return;
+    await mkdir(path.dirname(this.file), { recursive: true });
+    await appendFile(this.file, users.map((user) => JSON.stringify(user)).join("\n") + "\n", "utf8");
+  }
+
+  async readAll(): Promise<RankedUser[]> {
+    let raw: string;
+    try {
+      raw = await readFile(this.file, "utf8");
+    } catch {
+      return [];
+    }
+
+    const users: RankedUser[] = [];
+    for (const line of raw.split("\n")) {
+      if (!line) continue;
+      try {
+        users.push(JSON.parse(line) as RankedUser);
+      } catch {
+        // A truncated final line is the expected shape of an interrupted run,
+        // not a corrupt file. Drop it and keep every complete record.
+      }
+    }
+    return users;
+  }
+}
+
 interface CandidateFile {
   generatedAt: string;
   window: { hours: number; from: string; to: string };
@@ -909,35 +964,57 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
   const avatars = new Map(candidates.map((candidate) => [candidate.login, candidate.avatarUrl]));
   const window = contributionWindow(new Date(`${context.date}T00:00:00Z`));
 
-  const users: RankedUser[] = [];
+  // §5: persist after every batch, not at the end. A half-hour pass over a
+  // quarter of a million logins WILL be interrupted, and the previous shape —
+  // accumulate everything, write once at the end — meant any interruption threw
+  // away the whole run's budget. This also keeps the heap bounded.
+  const journal = new HydrationJournal(context.dataDir, context.date);
+  const done = await journal.open();
+  if (done.size > 0) {
+    console.log(`Resuming: ${done.size.toLocaleString()} logins already hydrated this snapshot`);
+  }
+
+  const remaining = candidates
+    .map((candidate) => candidate.login)
+    .filter((login) => !done.has(login));
+
   const skipped: string[] = [];
   let batches = 0;
+  let ranked = done.size;
 
-  await context.api.enrichUsers(
-    candidates.map((candidate) => candidate.login),
-    window,
-    {
-      calendar: false,
-      onBatch: ({ users: decoded, skipped: missing }) => {
-        for (const user of decoded) {
-          const ranked = toRankedUser(user, { avatarUrl: avatars.get(user.login) });
-          if (ranked.contributions.total <= 0) continue;
-          if (ranked.flagged) flagged.push(ranked);
-          else users.push(ranked);
-        }
-        skipped.push(...missing);
+  await context.api.enrichUsers(remaining, window, {
+    calendar: false,
+    // The heavy sorted connection. Off here and on for the calendars pass —
+    // leaving it on is what made this query unservable at any batch size.
+    languages: false,
+    onBatch: async ({ users: decoded, skipped: missing }) => {
+      const batch: RankedUser[] = [];
+      for (const user of decoded) {
+        const record = toRankedUser(user, { avatarUrl: avatars.get(user.login) });
+        if (record.contributions.total <= 0) continue;
+        batch.push(record);
+      }
+      await journal.append(batch);
+      ranked += batch.length;
+      skipped.push(...missing);
 
-        // One line per batch, as the standing rules require: this is the
-        // smallest unit at which a run can be seen going wrong.
-        if (++batches % 25 === 0 || decoded.length === 0) {
-          console.log(
-            `  batch ${String(batches).padStart(5)} · ${users.length.toLocaleString()} ranked · ` +
-              `${skipped.length} unresolved`,
-          );
-        }
-      },
+      // One line per batch, as the standing rules require: this is the
+      // smallest unit at which a run can be seen going wrong.
+      if (++batches % 25 === 0 || decoded.length === 0) {
+        console.log(
+          `  batch ${String(batches).padStart(5)} · ${ranked.toLocaleString()} ranked · ` +
+            `${skipped.length} unresolved`,
+        );
+      }
     },
-  );
+  });
+
+  // Read back what was written, including anything an earlier interrupted run
+  // contributed. Flagged accounts are separated here rather than at write time
+  // so a resumed run classifies the whole set by one rule.
+  const all = await journal.readAll();
+  const users = all.filter((user) => !user.flagged);
+  flagged.push(...all.filter((user) => user.flagged));
 
   console.log(
     `\nHydrated ${users.length.toLocaleString()} developers ` +
@@ -1095,6 +1172,9 @@ async function runCalendars(context: Context): Promise<void> {
 
   await context.api.enrichUsers(logins, window, {
     calendar: true,
+    // The one pass that needs it: these are the logins with a profile page, and
+    // the page renders a language donut.
+    languages: true,
     onBatch: async ({ users }) => {
       for (const user of users) {
         const ranked = toRankedUser(user, { avatarUrl: avatars.get(user.login) });
@@ -1167,12 +1247,17 @@ function tokenlessApi(tier: Tier): GitHubApi {
   return { searchUsers: refuse, searchRepositories: refuse, enrichUsers: refuse };
 }
 
-async function openApi(options: Options): Promise<GitHubApi> {
+async function openApi(options: Options, dataDir: string): Promise<GitHubApi> {
   if (options.fixtures) return loadFixtureClient();
   if (TOKENLESS_TIERS.has(options.tier)) return tokenlessApi(options.tier);
   return new GitHubClient({
     token: requireToken(),
-    languages: true,
+    // Off by default, and turned on per call by the one pass that needs it.
+    // It used to be on for every tier, which is what made the corpus-wide
+    // hydration query heavy enough for GitHub to answer with a gateway 502 at
+    // every batch size from 100 down to 25. See EnrichOptions.languages.
+    languages: false,
+    deadLetter: new DeadLetter({ dataDir }),
     log: (message) => console.warn(`  … ${message}`),
   });
 }
@@ -1180,7 +1265,7 @@ async function openApi(options: Options): Promise<GitHubApi> {
 export async function run(options: Options, dataDir: string = DATA_DIR): Promise<void> {
   const startedAt = Date.now();
   const context: Context = {
-    api: await openApi(options),
+    api: await openApi(options, dataDir),
     dataDir,
     date: new Date().toISOString().slice(0, 10),
     deadline: startedAt + BUDGET_MS,

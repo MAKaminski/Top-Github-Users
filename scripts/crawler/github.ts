@@ -46,8 +46,21 @@ const SEARCH_REQUESTS_PER_MINUTE = 30;
 export const GRAPHQL_BATCH_START = 100;
 const GRAPHQL_BATCH_MIN = 5;
 const GRAPHQL_BATCH_MAX = 100;
-/** Halved in order on timeout, per the rules. */
-const GRAPHQL_BATCH_LADDER = [100, 50, 25] as const;
+/**
+ * Halved in order on timeout, per the rules — down to the floor the client
+ * itself supports.
+ *
+ * It used to stop at 25 while `GRAPHQL_BATCH_MIN` was 5, so a batch that could
+ * not be served at 25 gave up with three viable sizes untried. That is not
+ * hypothetical: a real run took fifteen consecutive 502/504s walking
+ * 100 -> 50 -> 25 and then threw, losing 250,000 users of work.
+ *
+ * The floor matters because `contributionsCollection` is priced by GitHub's
+ * query executor rather than by the node count we can see, and an over-budget
+ * query comes back as a gateway 502 rather than a structured error. Walking
+ * down is the only way to find the ceiling.
+ */
+const GRAPHQL_BATCH_LADDER = [100, 50, 25, 10, 5] as const;
 /** Points we are willing to spend per enrichment request. One point per
  *  hundred logins is the documented shape; anything above that is a signal the
  *  selection grew, not a budget to spend. */
@@ -57,6 +70,28 @@ const GRAPHQL_TARGET_COST = 1;
 const GRAPHQL_RESERVE = 200;
 
 const MAX_ATTEMPTS = 5;
+
+/**
+ * Gateway errors get more patience than other failures.
+ *
+ * A 502/504 is not billed against the rate limit, so retrying one costs time
+ * and nothing else — and GitHub's GraphQL front end returns them both for a
+ * genuine wobble and for a query it decided was too expensive. Five attempts
+ * over thirty seconds is too little to ride out the first and too little to
+ * distinguish it from the second.
+ */
+const MAX_GATEWAY_ATTEMPTS = 8;
+
+/**
+ * Consecutive dead-lettered batches before the run gives up entirely.
+ *
+ * Dead-lettering exists so one pathological account cannot destroy a pass. It
+ * must not become a way to grind through a quarter of a million logins during a
+ * real outage, dropping every one of them and reporting "success". Three in a
+ * row with no batch served in between is not a poison record, it is the API
+ * being unavailable — and that deserves a failed job, loudly.
+ */
+const MAX_CONSECUTIVE_DEAD_LETTERS = 3;
 
 /** Returned in place of a body when the server answers 304. */
 export const NOT_MODIFIED = Symbol("not-modified");
@@ -159,6 +194,20 @@ export interface EnrichOptions {
    * Defaults to true, which is what every place-scoped tier wants.
    */
   calendar?: boolean;
+  /**
+   * Whether to request each user's top repositories, for the language mix.
+   *
+   * The same trap as `calendar`, and it caused the same failure: it adds a
+   * *sorted connection* per alias —
+   * `repositories(first: 25, orderBy: { field: STARGAZERS … })` — so a
+   * 100-alias batch asks GitHub to rank a hundred people's repositories and
+   * aggregate a hundred twelve-month contribution collections in one request.
+   * That is the shape that comes back as a gateway 502 rather than data.
+   *
+   * Only the ~10,000 profile pages render the language donut, so only the
+   * calendars pass needs this. Defaults to the client-level setting.
+   */
+  languages?: boolean;
   /**
    * Called after each batch is decoded.
    *
@@ -480,7 +529,19 @@ export interface ClientOptions {
   languages?: boolean;
   /** Persisted ETags. Omit and every REST call is unconditional. */
   etags?: ConditionalStore;
+  /** Where a unit of work goes when it cannot be served at any batch size.
+   *  Omit and such a batch is dropped with a log line but no record. */
+  deadLetter?: DeadLetterSink;
+  /** Injected so a test can exercise the retry and batch-ladder paths without
+   *  actually waiting out the backoff. Production never sets it. */
+  sleepImpl?: (ms: number) => Promise<unknown>;
   log?: (message: string) => void;
+}
+
+/** The slice of `limiter.ts`'s DeadLetter this client needs, named structurally
+ *  so github.ts does not depend on the limiter module. */
+export interface DeadLetterSink {
+  record(unit: string, error: string, attempts: number): Promise<void>;
 }
 
 export class GitHubClient implements GitHubApi {
@@ -492,6 +553,8 @@ export class GitHubClient implements GitHubApi {
   fetchImpl: typeof fetch;
   languages: boolean;
   etags?: ConditionalStore;
+  deadLetter?: DeadLetterSink;
+  sleep: (ms: number) => Promise<unknown>;
   /** Counts requests served from a 304, for the per-run budget report. */
   conditionalHits = 0;
   log: (message: string) => void;
@@ -503,6 +566,8 @@ export class GitHubClient implements GitHubApi {
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.languages = options.languages ?? false;
     this.etags = options.etags;
+    this.deadLetter = options.deadLetter;
+    this.sleep = options.sleepImpl ?? sleep;
     this.log = options.log ?? (() => {});
     this.searchLimiter = new TokenBucket(SEARCH_REQUESTS_PER_MINUTE);
     this.batchSize = GRAPHQL_BATCH_START;
@@ -597,6 +662,8 @@ export class GitHubClient implements GitHubApi {
     const skipped: string[] = [];
     const collect = options.onBatch === undefined;
     let batchIndex = 0;
+    let dropped = 0;
+    let consecutiveDrops = 0;
 
     for (let index = 0; index < logins.length; ) {
       const batch = logins.slice(index, index + this.batchSize);
@@ -613,7 +680,7 @@ export class GitHubClient implements GitHubApi {
           method: "POST",
           body: JSON.stringify({
             query: buildUserQuery(batch.length, {
-              languages: this.languages,
+              languages: options.languages ?? this.languages,
               calendar: options.calendar,
             }),
             variables,
@@ -628,7 +695,35 @@ export class GitHubClient implements GitHubApi {
           this.log(`GraphQL timed out; halving batch to ${this.batchSize}`);
           continue;
         }
-        throw error;
+        if (!isTimeout(error)) throw error;
+
+        // Bottom of the ladder. §4: never retry a unit of work more than five
+        // times — write it to the dead-letter file and move on. Throwing here
+        // would discard every batch already hydrated, which is how a run that
+        // had collected nothing yet still managed to lose 250,000 users.
+        await this.deadLetter?.record(
+          `enrich:${batch[0]}..${batch[batch.length - 1]}`,
+          error instanceof Error ? error.message : String(error),
+          GRAPHQL_BATCH_LADDER.length,
+        );
+        dropped += batch.length;
+        consecutiveDrops++;
+
+        if (consecutiveDrops >= MAX_CONSECUTIVE_DEAD_LETTERS) {
+          throw new Error(
+            `GraphQL served none of the last ${consecutiveDrops} batches at any size ` +
+              `(${GRAPHQL_BATCH_LADDER.join(", ")}). Treating this as an outage rather than ` +
+              `dead-lettering the remaining ${logins.length - index} logins. ` +
+              `Last error: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+
+        this.log(
+          `batch of ${batch.length} unserved at every batch size; dead-lettered ` +
+            `(${dropped} logins dropped so far) and continuing`,
+        );
+        this.resetBatchSize();
+        continue;
       }
 
       const fatal = fatalGraphQlError(body);
@@ -640,6 +735,8 @@ export class GitHubClient implements GitHubApi {
         }
         throw new Error(`GraphQL enrichment failed: ${fatal}`);
       }
+
+      consecutiveDrops = 0;
 
       const decoded = decodeGraphQlUsers(body, batch);
       // With a per-batch consumer the caller owns the records and this method
@@ -656,7 +753,22 @@ export class GitHubClient implements GitHubApi {
       await this.adaptBatchSize(rateLimitFrom(body), batch.length);
     }
 
+    if (dropped > 0) {
+      this.log(`${dropped} logins were never served and are listed in the dead-letter file`);
+    }
     return { users, skipped };
+  }
+
+  /**
+   * Back to the top of the ladder after a dead-letter.
+   *
+   * The batch that failed may have contained one pathological account rather
+   * than being too large — staying at the floor for the remaining quarter of a
+   * million would turn a 2,500-query pass into a 50,000-query one. If the size
+   * really is the problem the ladder simply walks down again.
+   */
+  private resetBatchSize(): void {
+    this.batchSize = GRAPHQL_BATCH_START;
   }
 
   /**
@@ -699,14 +811,21 @@ export class GitHubClient implements GitHubApi {
 
     const waitMs = Math.max(0, Date.parse(limit.resetAt) - Date.now()) + 1000;
     this.log(`GraphQL budget down to ${limit.remaining}; waiting ${Math.ceil(waitMs / 1000)}s`);
-    await sleep(waitMs);
+    await this.sleep(waitMs);
   }
 
   private async request(url: string, init: RequestInit): Promise<unknown> {
     let lastError = "";
+    let attempts = 0;
     const conditional = init.method !== "POST" ? this.etags?.get(url) : undefined;
 
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    // Grows to MAX_GATEWAY_ATTEMPTS the first time a 502/503/504 is seen, so a
+    // flaky front end gets ridden out without giving every other failure the
+    // same latitude.
+    let budget = MAX_ATTEMPTS;
+
+    for (let attempt = 0; attempt < budget; attempt++) {
+      attempts = attempt + 1;
       const response = await this.fetchImpl(url, {
         ...init,
         headers: {
@@ -739,19 +858,18 @@ export class GitHubClient implements GitHubApi {
       if (response.status === 401) throw new Error(badCredentials());
 
       const advised = retryAfterMs(response.headers);
-      const shouldRetry =
-        isTransient(response.status) ||
-        isSecondaryLimit(response.status, text) ||
-        advised !== null;
+      const transient = isTransient(response.status);
+      const shouldRetry = transient || isSecondaryLimit(response.status, text) || advised !== null;
 
       if (!shouldRetry) throw new Error(`${url} — ${lastError}`);
+      if (transient) budget = MAX_GATEWAY_ATTEMPTS;
 
       const waitMs = advised ?? backoffMs(attempt);
       this.log(`retrying ${new URL(url).pathname} in ${Math.ceil(waitMs / 1000)}s — ${lastError}`);
-      await sleep(Math.min(waitMs, MAX_BACKOFF_MS));
+      await this.sleep(Math.min(waitMs, MAX_BACKOFF_MS));
     }
 
-    throw new Error(`${url} — gave up after ${MAX_ATTEMPTS} attempts. ${lastError}`);
+    throw new Error(`${url} — gave up after ${attempts} attempts. ${lastError}`);
   }
 }
 

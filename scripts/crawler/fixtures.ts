@@ -85,9 +85,13 @@ export class FixtureClient implements GitHubApi {
       const data: Record<string, GraphUser | null> = {};
 
       batch.forEach((login, position) => {
-        const user = this.recorded.get(login) ?? null;
-        data[`u${position}`] =
-          user && options.calendar === false ? withoutDays(user) : user;
+        let user = this.recorded.get(login) ?? null;
+        if (user && options.calendar === false) user = withoutDays(user);
+        // Same reasoning as the days: the scalars pass genuinely does not
+        // receive repository nodes, and `languagesFrom` has to be exercised
+        // against their absence rather than always seeing them.
+        if (user && options.languages === false) user = withoutRepositoryNodes(user);
+        data[`u${position}`] = user;
       });
 
       const decoded = decodeGraphQlUsers({ data } as GraphQLBody, batch);
@@ -100,6 +104,12 @@ export class FixtureClient implements GitHubApi {
 
     return all;
   }
+}
+
+/** The same user as a query without `languages` would return them: the
+ *  repository count survives, the per-repo nodes do not. */
+function withoutRepositoryNodes(user: GraphUser): GraphUser {
+  return { ...user, repositories: { totalCount: user.repositories.totalCount } };
 }
 
 /** The same user as the scalars-only query would return them. */

@@ -23,7 +23,7 @@ import {
 import { CALENDAR_DAYS } from "../../lib/calendar.ts";
 import { COUNTRIES, COUNTRY_BY_SLUG } from "../lib/countries.ts";
 import { loadFixtureClient } from "./fixtures.ts";
-import { buildUserQuery, contributionWindow, requireToken } from "./github.ts";
+import { GitHubClient, buildUserQuery, contributionWindow, requireToken } from "./github.ts";
 import {
   assignRanks,
   AUTOMATION_THRESHOLD,
@@ -391,6 +391,122 @@ test("the scalars-only pass drops the days but keeps the twelve-month total", ()
   assert.match(scalars, /contributionCalendar \{\s*totalContributions\s*\}/);
   assert.match(scalars, /restrictedContributionsCount/);
   assert.match(scalars, /rateLimit \{ cost limit remaining resetAt nodeCount \}/);
+});
+
+test("the corpus pass asks for no sorted repository connection", () => {
+  // This is the query that took fifteen consecutive 502/504s at every batch
+  // size from 100 down to 25. `repositories(first: 25, orderBy: STARGAZERS)`
+  // per alias asks GitHub to rank a hundred people's repositories *and*
+  // aggregate a hundred twelve-month contribution collections in one request.
+  const heavy = buildUserQuery(100, { languages: true, calendar: false });
+  assert.match(heavy, /repositories\(first: 25/);
+
+  const light = buildUserQuery(100, { languages: false, calendar: false });
+  assert.doesNotMatch(light, /repositories\(first:/);
+  assert.doesNotMatch(light, /orderBy/);
+  assert.doesNotMatch(light, /primaryLanguage/);
+  // The plain count is a scalar and still wanted — it is `publicRepos`.
+  assert.match(light, /repositories \{ totalCount \}/);
+});
+
+test("the batch ladder walks all the way down to the client's own floor", async () => {
+  // It used to stop at 25 while the client supported 5, so a batch that could
+  // not be served at 25 gave up with three viable sizes untried — and took a
+  // whole run's worth of hydrated users down with it.
+  const sizes: number[] = [];
+  const client = new GitHubClient({
+    token: "t",
+    sleepImpl: async () => {},
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit).body)) as { variables: object };
+      // One variable is `from`, one is `to`; the rest are aliases.
+      sizes.push(Object.keys(body.variables).length - 2);
+      return new Response("gateway", { status: 502 });
+    },
+  });
+
+  const logins = Array.from({ length: 100 }, (_, i) => `dev${i}`);
+
+  // Nothing is ever served, so after three dead-lettered batches the client
+  // calls it an outage rather than dropping the rest of the corpus quietly.
+  await assert.rejects(
+    () => client.enrichUsers(logins, { from: "a", to: "b" }),
+    /served none of the last 3 batches/,
+  );
+
+  // Each rung is attempted several times at the HTTP layer before the ladder
+  // steps down, so collapse the runs and check the sequence of distinct sizes.
+  const rungs = sizes.filter((size, i) => size !== sizes[i - 1]);
+  assert.deepEqual(
+    rungs.slice(0, 5),
+    [100, 50, 25, 10, 5],
+    "the first batch walks every rung before being given up on",
+  );
+});
+
+test("a batch nobody can serve is dead-lettered, and the run carries on", async () => {
+  const recorded: { unit: string; attempts: number }[] = [];
+  let call = 0;
+
+  const client = new GitHubClient({
+    token: "t",
+    sleepImpl: async () => {},
+    deadLetter: {
+      record: async (unit, _error, attempts) => {
+        recorded.push({ unit, attempts });
+      },
+    },
+    // The first batch is unservable at every size; everything after it is fine.
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit).body)) as {
+        variables: Record<string, string>;
+      };
+      const aliases = Object.keys(body.variables).filter((key) => key !== "from" && key !== "to");
+      if (aliases.some((alias) => body.variables[alias] === "poison")) {
+        call++;
+        return new Response("gateway", { status: 502 });
+      }
+      return Response.json({
+        data: Object.fromEntries(
+          aliases.map((alias) => [
+            alias,
+            {
+              login: body.variables[alias],
+              name: null,
+              avatarUrl: "",
+              location: null,
+              company: null,
+              bio: null,
+              followers: { totalCount: 1 },
+              repositories: { totalCount: 1 },
+              contributionsCollection: {
+                totalCommitContributions: 1,
+                totalPullRequestContributions: 0,
+                totalIssueContributions: 0,
+                totalPullRequestReviewContributions: 0,
+                restrictedContributionsCount: 0,
+                contributionCalendar: { totalContributions: 1 },
+              },
+            },
+          ]),
+        ),
+      });
+    },
+  });
+
+  // Batch size starts at 100, so "poison" lands in the first batch and the
+  // survivors in the second.
+  const logins = ["poison", ...Array.from({ length: 140 }, (_, i) => `dev${i}`)];
+  const result = await client.enrichUsers(logins, { from: "a", to: "b" }, { calendar: false });
+
+  assert.equal(recorded.length, 1, "the unservable batch is recorded once");
+  assert.ok(recorded[0].unit.startsWith("enrich:poison"));
+  assert.ok(call >= 5, "it was genuinely retried before being dropped");
+
+  // The whole point: the run did not die. Everything outside the poisoned batch
+  // still came back.
+  assert.ok(result.users.length > 0, "surviving batches were still hydrated");
+  assert.ok(!result.users.some((user) => user.login === "poison"));
 });
 
 test("a user hydrated without days gets no calendar rather than an empty one", () => {
