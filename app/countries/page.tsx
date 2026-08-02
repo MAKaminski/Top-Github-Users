@@ -8,7 +8,11 @@ import { abbreviate, exact, rankLabel } from "@/lib/format";
 
 export const metadata: Metadata = {
   title: "Countries",
-  description: "GitHub contribution leaderboards for every tracked country.",
+  description:
+    "GitHub contribution leaderboards for every tracked country, ranked by the developers who " +
+    "list that country on their profile.",
+  alternates: { canonical: "/countries" },
+  openGraph: { title: "Top GitHub developers by country · Commitgraph", url: "/countries" },
 };
 
 export default async function CountriesPage() {

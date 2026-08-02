@@ -6,7 +6,14 @@ import { abbreviate, exact } from "@/lib/format";
 
 export const metadata: Metadata = {
   title: "Search developers",
-  description: "Search every developer in the Commitgraph snapshot by login, name, company or location.",
+  description:
+    "Search every developer in the Commitgraph snapshot by login, name, company or location.",
+  alternates: { canonical: "/search" },
+  // Every query, filter and offset is a distinct URL over near-identical
+  // content. Indexing that space would bury the pages worth finding under an
+  // unbounded number of thin ones. `follow` stays on so the profile links a
+  // result page contains are still discovered.
+  robots: { index: false, follow: true },
 };
 
 const PAGE = 50;

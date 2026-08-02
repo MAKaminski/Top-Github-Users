@@ -3,6 +3,8 @@
 import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { useRouter } from "next/navigation";
 
+import { track } from "@/components/analytics";
+
 /**
  * Developer search, as a combobox in the nav.
  *
@@ -94,6 +96,16 @@ export function SearchBox({ className = "" }: { className?: string }) {
 
   const go = (item: Suggestion) => {
     setOpen(false);
+    // What we want to learn from this is whether the suggestion list is doing
+    // its job — the position tells us whether people take the first hit or hunt.
+    // The query itself is recorded because it is the whole point of the event;
+    // it is a developer login or place name, not personal data.
+    track("search_result_selected", {
+      query,
+      login: item.login,
+      position: items.indexOf(item),
+      has_profile: item.hasProfile,
+    });
     if (item.hasProfile) router.push(`/u/${item.login}`);
     else window.open(`https://github.com/${item.login}`, "_blank", "noreferrer");
   };

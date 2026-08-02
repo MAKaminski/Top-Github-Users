@@ -6,7 +6,12 @@ import { abbreviate, exact } from "@/lib/format";
 
 export const metadata: Metadata = {
   title: "Methodology",
-  description: "How Commitgraph's numbers are produced, and where they are wrong.",
+  description:
+    "How Commitgraph's numbers are produced and where they are wrong: the contribution window, " +
+    "private-contribution handling, location parsing, estimated calendars, and the accounts " +
+    "excluded as automation.",
+  alternates: { canonical: "/methodology" },
+  openGraph: { title: "Methodology · Commitgraph", url: "/methodology" },
 };
 
 export default async function MethodologyPage() {

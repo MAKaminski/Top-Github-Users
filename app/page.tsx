@@ -5,8 +5,10 @@ import { HoverPreviewIndex } from "@/components/patterns/hover-preview-index";
 import { MagneticCta } from "@/components/patterns/magnetic-cta";
 import { FollowersScatter } from "@/components/charts/scatter";
 import { TileGridMap } from "@/components/charts/tile-grid-map";
+import { StructuredData } from "@/components/structured-data";
 import { getManifest, getWorldwide } from "@/lib/data";
 import { abbreviate, exact } from "@/lib/format";
+import { datasetSchema, leaderboardSchema, websiteSchema } from "@/lib/structured-data";
 
 export default async function HomePage() {
   const [manifest, worldwide] = await Promise.all([getManifest(), getWorldwide()]);
@@ -14,6 +16,22 @@ export default async function HomePage() {
 
   return (
     <>
+      <StructuredData
+        data={[
+          websiteSchema(),
+          datasetSchema(manifest),
+          leaderboardSchema({
+            entries: worldwide.entries,
+            path: "/",
+            name: "Most active developers on GitHub worldwide",
+            description:
+              "Ranked by public and private contributions over the trailing twelve months.",
+            // The home page shows 25; the graph carries the same 25 rather than
+            // claiming a depth the page does not display.
+            limit: 25,
+          }),
+        ]}
+      />
       {/* ---- Hero: hero-statement + masked-line-reveal, used once ---------- */}
       <section className="shell flex min-h-[calc(100svh-var(--nav-h))] flex-col justify-between pb-[var(--space-lg)] pt-[var(--space-lg)]">
         <div className="egrid items-end">

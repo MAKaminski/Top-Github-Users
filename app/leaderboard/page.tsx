@@ -5,16 +5,58 @@ import { LeaderboardInfinite } from "@/components/leaderboard-infinite";
 import { ScrollProgressRule } from "@/components/patterns/scroll-progress-rule";
 import { ViewportStaggerReveal } from "@/components/patterns/viewport-stagger-reveal";
 import { HeatmapLegend } from "@/components/charts/heatmap";
+import { StructuredData } from "@/components/structured-data";
 import { getLeaderboard, getManifest, isSort, type Sort } from "@/lib/api/queries";
+import { breadcrumbSchema, leaderboardSchema } from "@/lib/structured-data";
 import { exact } from "@/lib/format";
-
-export const metadata: Metadata = {
-  title: "Worldwide leaderboard",
-  description: "The most active developers on GitHub worldwide, ranked by contributions.",
-};
 
 /** Rendered on the server. The client continues from here as the reader scrolls. */
 const FIRST_PAGE = 100;
+
+/**
+ * How deep the paginated series stays indexable.
+ *
+ * A 250,000-row board is 2,500 offset URLs per sort — 7,500 near-identical
+ * pages of a hundred rows each. Left indexable they would swamp the pages worth
+ * finding and spend the crawl budget on thin duplicates. The head of each sort
+ * is genuinely useful and stays indexed; past that the depth is served by the
+ * individually-indexed profile pages, which is where the long tail belongs.
+ */
+const INDEXABLE_OFFSET = 900;
+
+export async function generateMetadata({
+  searchParams,
+}: {
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}): Promise<Metadata> {
+  const params = await searchParams;
+  const raw = params.sort;
+  const requested = (Array.isArray(raw) ? raw[0] : raw)?.trim();
+  const sort: Sort = requested && isSort(requested) ? requested : "contributions";
+  const offsetRaw = params.offset;
+  const offset = Math.max(0, Number((Array.isArray(offsetRaw) ? offsetRaw[0] : offsetRaw) ?? 0) || 0);
+
+  // Self-canonical, including the parameters. An offset page holds different
+  // developers, and a sort holds a different ordering — collapsing either onto
+  // `/leaderboard` would tell Google that pages showing different people are
+  // the same page.
+  const query = new URLSearchParams();
+  if (sort !== "contributions") query.set("sort", sort);
+  if (offset > 0) query.set("offset", String(offset));
+  const canonical = query.size ? `/leaderboard?${query}` : "/leaderboard";
+
+  const by = { contributions: "contributions", followers: "followers", streak: "streak" }[sort];
+  const from = offset > 0 ? ` Ranks ${offset + 1} to ${offset + FIRST_PAGE}.` : "";
+
+  return {
+    title: offset > 0 ? `Worldwide leaderboard — from rank ${offset + 1}` : "Worldwide leaderboard",
+    description:
+      `The most active developers on GitHub worldwide, ranked by ${by} over the trailing ` +
+      `twelve months.${from}`,
+    alternates: { canonical },
+    robots: offset > INDEXABLE_OFFSET ? { index: false, follow: true } : undefined,
+  };
+}
 
 const SORT_LABELS: Record<Sort, string> = {
   contributions: "Contributions",
@@ -53,6 +95,20 @@ export default async function LeaderboardPage({
 
   return (
     <>
+      <StructuredData
+        data={[
+          leaderboardSchema({
+            entries: page.items,
+            path: linkFor(sort),
+            name: `Most active developers on GitHub worldwide, by ${sort}`,
+            description: `Ranks ${offset + 1} to ${offset + page.items.length} of ${page.total}.`,
+          }),
+          breadcrumbSchema([
+            { name: "Commitgraph", path: "/" },
+            { name: "Leaderboard", path: "/leaderboard" },
+          ]),
+        ]}
+      />
       <ScrollProgressRule />
 
       <section className="shell py-[var(--space-lg)]">

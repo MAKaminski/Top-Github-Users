@@ -12,6 +12,8 @@ import { abbreviate, exact, rankLabel } from "@/lib/format";
 export const metadata: Metadata = {
   title: "The top ten",
   description: "A panel-by-panel walk through the ten most active developers on GitHub.",
+  alternates: { canonical: "/podium" },
+  openGraph: { title: "The ten most active developers on GitHub · Commitgraph", url: "/podium" },
 };
 
 export default async function PodiumPage() {

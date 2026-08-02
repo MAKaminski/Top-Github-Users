@@ -8,7 +8,9 @@ import { Heatmap, HeatmapLegend } from "@/components/charts/heatmap";
 import { Sparkline } from "@/components/charts/sparkline";
 import { SplitBar } from "@/components/charts/split-bar";
 import { StreakRing } from "@/components/charts/streak-ring";
+import { StructuredData } from "@/components/structured-data";
 import { getManifest, getProfileLogins, getUser } from "@/lib/data";
+import { breadcrumbSchema, personSchema } from "@/lib/structured-data";
 import { calendarFor, monthlyFrom, streaksFrom } from "@/lib/calendar";
 import { flagOf } from "@/scripts-shared/flags";
 import { abbreviate, exact, pseudoHash, rankLabel } from "@/lib/format";
@@ -26,9 +28,29 @@ export async function generateMetadata({
   const { login } = await params;
   const user = await getUser(login);
   if (!user) return {};
+
+  const name = user.name ?? user.login;
+  // The rank is the fact that makes this page worth a search result, so it goes
+  // in the description rather than being left for the crawler to find in a
+  // stat block. Falls back cleanly for anyone hydrated without a worldwide rank.
+  const rank = user.rank.worldwide ? ` Ranked #${exact(user.rank.worldwide)} worldwide.` : "";
+  const where = user.location ? ` Based in ${user.location}.` : "";
+  const description =
+    `${name} (@${user.login}) made ${exact(user.contributions.total)} contributions on GitHub ` +
+    `in the last twelve months.${rank}${where}`;
+
   return {
-    title: `${user.name ?? user.login}`,
-    description: `${user.login} made ${exact(user.contributions.total)} contributions in the last twelve months.`,
+    title: name,
+    description,
+    alternates: { canonical: `/u/${user.login}` },
+    openGraph: {
+      type: "profile",
+      title: `${name} · Commitgraph`,
+      description,
+      url: `/u/${user.login}`,
+      images: [{ url: user.avatarUrl, width: 160, height: 160, alt: `${name}'s GitHub avatar` }],
+    },
+    twitter: { card: "summary", title: `${name} · Commitgraph`, description },
   };
 }
 
@@ -44,6 +66,16 @@ export default async function ProfilePage({ params }: { params: Promise<{ login:
 
   return (
     <article className="shell py-[var(--space-lg)]">
+      <StructuredData
+        data={[
+          personSchema(user, manifest),
+          breadcrumbSchema([
+            { name: "Commitgraph", path: "/" },
+            { name: "Leaderboard", path: "/leaderboard" },
+            { name: user.name ?? user.login, path: `/u/${user.login}` },
+          ]),
+        ]}
+      />
       <div className="egrid items-start gap-y-[var(--space-md)]">
         {/* ---- Identity ---------------------------------------------------- */}
         <div className="col-span-full lg:col-span-4">

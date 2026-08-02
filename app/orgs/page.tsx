@@ -8,6 +8,8 @@ export const metadata: Metadata = {
   title: "Organizations",
   description:
     "Organizations ranked by the aggregate contributions of the developers who list them.",
+  alternates: { canonical: "/orgs" },
+  openGraph: { title: "Top organizations on GitHub · Commitgraph", url: "/orgs" },
 };
 
 export default async function OrgsPage() {
