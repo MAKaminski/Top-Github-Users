@@ -48,7 +48,17 @@ import {
   type RankField,
 } from "./transform.ts";
 import { previousRanks, readHistory, updateHistory } from "./history.ts";
-import { isDue, orderByStaleness, readState, recordCompletion, writeState } from "./state.ts";
+import {
+  isDue,
+  orderByStaleness,
+  pruneHours,
+  readState,
+  recordCompletion,
+  recordHour,
+  writeState,
+} from "./state.ts";
+import { discover, filterCandidates, recentHours } from "./gharchive.ts";
+import { assertWithinBudget, estimateBudget, formatBudget } from "./budget.ts";
 
 /** Board depths. Larger than the seeder's — the crawler pays for its own data
  *  and can afford to keep more of it. */
@@ -72,6 +82,9 @@ const DAILY_COUNTRIES = 40;
 
 /** Re-crawl intervals, in days, per tier. */
 const FRESHNESS: Record<Tier, number> = {
+  // Discovery costs no API budget, so it can run as often as the archive
+  // publishes. Its own hour cache is what stops it redoing work.
+  discover: 0,
   worldwide: 1,
   countries: 1,
   cities: 25,
@@ -86,7 +99,30 @@ const FRESHNESS: Record<Tier, number> = {
  */
 const BUDGET_MS = 50 * 60_000;
 
-const TIERS = ["worldwide", "countries", "cities", "orgs", "repos"] as const;
+/** Seven days. Wide enough that anyone meaningfully active appears, and fetched
+ *  hours are cached in state so incremental runs pull only what is new. */
+const DEFAULT_ARCHIVE_HOURS = 168;
+/** Tuned against three real hours of the archive: >=5 events kept ~11,000 of
+ *  110,000 actors, which is the right order of magnitude for a hydration pass
+ *  that has to fit inside 5,000 points an hour. */
+const DEFAULT_MIN_EVENTS = 5;
+/**
+ * Hours retained in state purely as a record of what was scanned.
+ *
+ * It is deliberately NOT a skip-list. The window is *rolling*: hours fall out
+ * of it as new ones arrive, and a merged actor total can be added to but never
+ * subtracted from, so skipping already-seen hours would quietly turn a 7-day
+ * window into an all-time one. It would also strand actors below the threshold
+ * — someone with four events this window and four the next would be discarded
+ * both times and never accumulate to eight.
+ *
+ * Rescanning is the correct answer because it is cheap: measured at roughly
+ * 7 seconds per four hours, a full 7-day window is a few minutes and costs no
+ * API budget at all.
+ */
+const ARCHIVE_HOURS_RETAINED = DEFAULT_ARCHIVE_HOURS * 2;
+
+const TIERS = ["discover", "worldwide", "countries", "cities", "orgs", "repos"] as const;
 export type Tier = (typeof TIERS)[number];
 
 interface Shard {
@@ -99,10 +135,21 @@ export interface Options {
   tier: Tier;
   shard: Shard | null;
   limit: number | null;
+  /** Trailing GH Archive hours to fold into discovery. 168 is seven days. */
+  hours: number;
+  /** Minimum public authorship events for a login to be worth hydrating. */
+  minEvents: number;
 }
 
 export function parseOptions(argv: string[]): Options {
-  const options: Options = { fixtures: false, tier: "worldwide", shard: null, limit: null };
+  const options: Options = {
+    fixtures: false,
+    tier: "worldwide",
+    shard: null,
+    limit: null,
+    hours: DEFAULT_ARCHIVE_HOURS,
+    minEvents: DEFAULT_MIN_EVENTS,
+  };
 
   for (const arg of argv) {
     if (arg === "--fixtures") {
@@ -120,6 +167,16 @@ export function parseOptions(argv: string[]): Options {
       const limit = Number(raw);
       if (!Number.isInteger(limit) || limit < 1) throw new Error("--limit must be a positive integer");
       options.limit = limit;
+    } else if (flag === "--hours") {
+      const hours = Number(raw);
+      if (!Number.isInteger(hours) || hours < 1 || hours > 720) {
+        throw new Error("--hours must be between 1 and 720");
+      }
+      options.hours = hours;
+    } else if (flag === "--min-events") {
+      const min = Number(raw);
+      if (!Number.isInteger(min) || min < 1) throw new Error("--min-events must be a positive integer");
+      options.minEvents = min;
     } else {
       throw new Error(`Unknown argument: ${arg}`);
     }
@@ -818,6 +875,9 @@ export async function run(options: Options, dataDir: string = DATA_DIR): Promise
   const flagged: RankedUser[] = [];
 
   switch (options.tier) {
+    case "discover":
+      await runDiscovery(context, options);
+      return;
     case "worldwide":
       await runWorldwide(context, flagged);
       break;
@@ -858,6 +918,97 @@ if (invokedDirectly) {
     console.error(error instanceof Error ? error.message : error);
     process.exitCode = 1;
   });
+}
+
+export interface Candidate {
+  login: string;
+  avatarUrl: string;
+  events: number;
+  repos: number;
+  lastSeen: string;
+}
+
+/**
+ * Discovery — the free half of the pipeline.
+ *
+ * Spends no API budget at all: GH Archive is public object storage. This is
+ * what makes a full refresh timely, because the alternative (REST user search
+ * at 30 requests a minute, capped at 1,000 results per query) costs thousands
+ * of requests and hours of wall clock before a single profile is hydrated.
+ *
+ * Writes a ranked candidate list for the hydration tiers to consume, and prints
+ * the budget that hydrating it would cost so an oversized set is caught here
+ * rather than halfway through an Actions run.
+ */
+async function runDiscovery(context: Context, options: Options): Promise<void> {
+  const state = await readState(context.dataDir);
+  const wanted = recentHours(options.hours, new Date());
+
+  console.log(`GH Archive: scanning ${wanted.length} hours (${wanted[wanted.length - 1]} → ${wanted[0]})`);
+
+  let done = 0;
+  const result = await discover(wanted, {
+    concurrency: 4,
+    onHour: (hour) => {
+      done++;
+      if (hour.status === "ok") recordHour(state, hour.hour, hour.events);
+      // One line per hour: the standing rules require per-batch logging, and an
+      // hour is the batch.
+      console.log(
+        `  [${String(done).padStart(3)}/${wanted.length}] ${hour.hour} ${hour.status.padEnd(7)} ` +
+          `events=${String(hour.events).padStart(7)} ${(hour.bytes / 1e6).toFixed(1)}MB ` +
+          `${(hour.elapsedMs / 1000).toFixed(1)}s${hour.error ? ` — ${hour.error}` : ""}`,
+      );
+    },
+  });
+
+  const missing = result.hours.filter((h) => h.status !== "ok");
+  console.log(
+    `\n${result.totalEvents.toLocaleString()} authorship events · ` +
+      `${result.actors.length.toLocaleString()} distinct actors · ` +
+      `${(result.totalBytes / 1e6).toFixed(0)}MB · ` +
+      `${(result.elapsedMs / 1000).toFixed(1)}s · 0 API points spent` +
+      (missing.length ? ` · ${missing.length} hours unavailable` : ""),
+  );
+
+  const { candidates, droppedBots, droppedLoops } = filterCandidates(result.actors, {
+    minEvents: options.minEvents,
+    limit: context.limit ?? undefined,
+    // Anyone already on a board survives regardless of a quiet week, or the
+    // leaderboard would churn on nothing.
+    alwaysKeep: context.profiles,
+  });
+
+  console.log(
+    `${candidates.length.toLocaleString()} candidates at >=${options.minEvents} events ` +
+      `(dropped ${droppedBots} bots, ${droppedLoops} single-repo loops)`,
+  );
+
+  // §8: state the budget before any hydration is attempted.
+  const estimate = estimateBudget({ usersToHydrate: candidates.length, batchSize: 100 });
+  console.log(`\n${formatBudget(estimate)}`);
+  assertWithinBudget(estimate);
+
+  await writeJson(path.join(context.dataDir, "discovery", "candidates.json"), {
+    generatedAt: context.date,
+    window: { hours: options.hours, from: wanted[wanted.length - 1], to: wanted[0] },
+    minEvents: options.minEvents,
+    actorsSeen: result.actors.length,
+    hoursScanned: result.hours.filter((h) => h.status === "ok").length,
+    hoursUnavailable: missing.map((h) => h.hour),
+    candidates: candidates.map(
+      (a): Candidate => ({
+        login: a.login,
+        avatarUrl: a.avatarUrl,
+        events: a.events,
+        repos: a.repos,
+        lastSeen: a.lastSeen,
+      }),
+    ),
+  });
+
+  pruneHours(state, ARCHIVE_HOURS_RETAINED);
+  await writeState(state, context.dataDir);
 }
 
 async function main(): Promise<void> {

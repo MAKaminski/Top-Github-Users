@@ -13,6 +13,7 @@ on:
   schedule:
     # Off the hour: everything else in the world is scheduled on it, and GitHub
     # queues scheduled runs accordingly.
+    - cron: "5 */6 * * *" # 6-hourly — GH Archive discovery (no API budget)
     - cron: "17 3 * * *" # daily   — worldwide + the largest countries
     - cron: "43 4 * * 0" # weekly  — remaining countries, organisations, repositories
     - cron: "11 5 1 * *" # monthly — cities
@@ -22,7 +23,7 @@ on:
         description: Tier to run
         type: choice
         default: worldwide
-        options: [worldwide, countries, cities, orgs, repos]
+        options: [discover, worldwide, countries, cities, orgs, repos]
       shard:
         description: "Shard, as N/M — countries and cities only"
         type: string
@@ -54,6 +55,30 @@ jobs:
                  "cannot reach the API and would commit an empty snapshot over good data."
             exit 1
           fi
+
+  # Discovery reads GH Archive, which is public object storage — no token, and
+  # therefore deliberately NOT gated on the `token` job. It can run even when the
+  # crawl secret is missing, which is exactly when knowing the candidate set is
+  # most useful.
+  discover:
+    if: github.event.schedule == '5 */6 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'discover')
+    name: discover
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Discover candidates from GH Archive
+        run: pnpm crawl --tier=discover ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      - name: Commit
+        run: .github/scripts/commit-data.sh discover
 
   worldwide:
     needs: token

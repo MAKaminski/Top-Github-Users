@@ -48,12 +48,31 @@ export default async function MethodologyPage() {
           </div>
 
           <div>
+            <h2 className="text-h2">How developers are found</h2>
+            <p className="mt-[var(--space-2xs)] text-muted">
+              Candidates come from{" "}
+              <a href="https://www.gharchive.org/" className="underline underline-offset-4">
+                GH Archive
+              </a>
+              , the public record of every public GitHub event. Streaming a rolling seven-day
+              window finds everyone who did something visible, costs no API budget at all, and
+              takes seconds rather than the hours a search-based sweep needs. Only the filtered
+              survivors are then looked up through GitHub&rsquo;s API.
+            </p>
+            <p className="mt-[var(--space-2xs)] text-muted">
+              The limit worth knowing: the archive only records <em>public</em> activity, so
+              somebody working almost entirely in private repositories does not appear in it. A
+              smaller search pass covers that gap. Accounts firing thousands of events at a single
+              repository are dropped as automation before anything is looked up.
+            </p>
+          </div>
+
+          <div>
             <h2 className="text-h2">Where location comes from</h2>
             <p className="mt-[var(--space-2xs)] text-muted">
               GitHub has no structured country or city field — only a free-text line that people
-              fill in however they like. Country comes from searching that field; city is parsed
-              from the same string and kept only where at least eight tracked developers agree on
-              a name. &ldquo;Earth&rdquo;, &ldquo;remote&rdquo; and &ldquo;/dev/null&rdquo; are
+              fill in however they like. Both country and city are parsed from that one string,
+              and a city is kept only where at least eight tracked developers agree on a name. &ldquo;Earth&rdquo;, &ldquo;remote&rdquo; and &ldquo;/dev/null&rdquo; are
               discarded rather than guessed at. This is the single largest source of error on the
               site, and it affects every competitor equally.
             </p>

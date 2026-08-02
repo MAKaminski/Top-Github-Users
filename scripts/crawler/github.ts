@@ -31,18 +31,46 @@ export const SEARCH_RESULT_CAP = SEARCH_PER_PAGE * SEARCH_MAX_PAGES;
  *  5000-per-hour core limit, and exceeding it earns a secondary-limit block. */
 const SEARCH_REQUESTS_PER_MINUTE = 30;
 
-/** Alias batching. 25 logins keeps a single request well inside the node limit
- *  even for accounts with enormous calendars; the measured cost moves it. */
-export const GRAPHQL_BATCH_START = 25;
+/**
+ * Alias batching.
+ *
+ * The standing rules are explicit: start at 100 and halve to 50 then 25 on a
+ * query timeout. 100 aliases is a single point for a hundred profiles, which is
+ * the whole reason hydration is affordable — at 25 we were paying four times
+ * over for the same work.
+ *
+ * The ladder is for TIMEOUTS specifically. Measured `rateLimit.cost` separately
+ * shrinks the batch when a selection turns out heavier than expected; the two
+ * mechanisms answer different failures and both are needed.
+ */
+export const GRAPHQL_BATCH_START = 100;
 const GRAPHQL_BATCH_MIN = 5;
-const GRAPHQL_BATCH_MAX = 50;
-/** Points we are willing to spend per enrichment request. */
-const GRAPHQL_TARGET_COST = 25;
+const GRAPHQL_BATCH_MAX = 100;
+/** Halved in order on timeout, per the rules. */
+const GRAPHQL_BATCH_LADDER = [100, 50, 25] as const;
+/** Points we are willing to spend per enrichment request. One point per
+ *  hundred logins is the documented shape; anything above that is a signal the
+ *  selection grew, not a budget to spend. */
+const GRAPHQL_TARGET_COST = 1;
 /** Below this many points left in the hour, wait for the reset rather than
  *  burning the remainder and having the run die mid-place. */
 const GRAPHQL_RESERVE = 200;
 
 const MAX_ATTEMPTS = 5;
+
+/** Returned in place of a body when the server answers 304. */
+export const NOT_MODIFIED = Symbol("not-modified");
+
+/**
+ * A sentinel array meaning "identical to the stored copy", distinct from an
+ * empty array, which is the real answer "this place has no users". Conflating
+ * the two would let a free 304 silently wipe a board.
+ */
+export const UNCHANGED: readonly never[] = Object.freeze([]);
+
+export function isUnchanged<T>(result: T[]): boolean {
+  return (result as unknown) === UNCHANGED;
+}
 const BACKOFF_BASE_MS = 1000;
 const MAX_BACKOFF_MS = 60_000;
 
@@ -269,6 +297,10 @@ export interface RateLimitInfo {
   cost: number;
   remaining: number;
   resetAt: string;
+  /** Selected so the hourly ceiling is observed rather than hardcoded. */
+  limit?: number;
+  /** The node count this query actually consumed, against the 500,000 cap. */
+  nodeCount?: number;
 }
 
 /**
@@ -348,9 +380,23 @@ export function buildUserQuery(count: number, options: { languages?: boolean } =
   }
 
   return `query Enrich(${params.join(", ")}) {
-  rateLimit { cost remaining resetAt }
+  rateLimit { cost limit remaining resetAt nodeCount }
 ${fields.join("\n")}
 }`;
+}
+
+/**
+ * Conditional-request store.
+ *
+ * A REST response that comes back `304 Not Modified` does NOT count against the
+ * primary rate limit. On a re-crawl of mostly-unchanged data that makes the
+ * whole pass close to free, which is the difference between a nightly refresh
+ * being affordable and being the entire hourly budget. GraphQL has no
+ * equivalent — there we skip on a stored `updatedAt` instead.
+ */
+export interface ConditionalStore {
+  get(key: string): string | undefined;
+  set(key: string, etag: string): void;
 }
 
 export interface ClientOptions {
@@ -360,13 +406,22 @@ export interface ClientOptions {
   /** Off by default: the extra repository page roughly doubles the node count
    *  of an enrichment request for a field the UI can live without. */
   languages?: boolean;
+  /** Persisted ETags. Omit and every REST call is unconditional. */
+  etags?: ConditionalStore;
   log?: (message: string) => void;
 }
 
 export class GitHubClient implements GitHubApi {
+  /** Sentinel for a conditional hit — distinct from an empty result, which is a
+   *  real answer meaning "this place has no users". */
+  static readonly NOT_MODIFIED = NOT_MODIFIED;
+
   token: string;
   fetchImpl: typeof fetch;
   languages: boolean;
+  etags?: ConditionalStore;
+  /** Counts requests served from a 304, for the per-run budget report. */
+  conditionalHits = 0;
   log: (message: string) => void;
   searchLimiter: TokenBucket;
   batchSize: number;
@@ -375,6 +430,7 @@ export class GitHubClient implements GitHubApi {
     this.token = options.token;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.languages = options.languages ?? false;
+    this.etags = options.etags;
     this.log = options.log ?? (() => {});
     this.searchLimiter = new TokenBucket(SEARCH_REQUESTS_PER_MINUTE);
     this.batchSize = GRAPHQL_BATCH_START;
@@ -419,6 +475,16 @@ export class GitHubClient implements GitHubApi {
 
       await this.searchLimiter.take();
       const body = await this.request(url.toString(), { method: "GET" });
+
+      // 304: this page is byte-identical to the last crawl and cost no budget.
+      // Every later page of the same query would be too, so stop rather than
+      // paging on — and signal "unchanged" by returning nothing, which lets the
+      // caller keep the stored board instead of overwriting it with a partial.
+      if (body === NOT_MODIFIED) {
+        if (page === 1) return UNCHANGED as unknown as T[];
+        break;
+      }
+
       const items = decode(body);
       out.push(...items);
 
@@ -442,16 +508,36 @@ export class GitHubClient implements GitHubApi {
         variables[aliasFor(position)] = login;
       });
 
-      const body = (await this.request(GRAPHQL_ENDPOINT, {
-        method: "POST",
-        body: JSON.stringify({
-          query: buildUserQuery(batch.length, { languages: this.languages }),
-          variables,
-        }),
-      })) as GraphQLBody;
+      let body: GraphQLBody;
+      try {
+        body = (await this.request(GRAPHQL_ENDPOINT, {
+          method: "POST",
+          body: JSON.stringify({
+            query: buildUserQuery(batch.length, { languages: this.languages }),
+            variables,
+          }),
+        })) as GraphQLBody;
+      } catch (error) {
+        // A timeout is not a reason to fail the tier — it is the signal to
+        // halve. Rewind so the same logins are retried at the smaller size;
+        // a smaller batch is cheaper than a retry at the same size.
+        if (isTimeout(error) && this.stepBatchSizeDown()) {
+          index -= batch.length;
+          this.log(`GraphQL timed out; halving batch to ${this.batchSize}`);
+          continue;
+        }
+        throw error;
+      }
 
       const fatal = fatalGraphQlError(body);
-      if (fatal) throw new Error(`GraphQL enrichment failed: ${fatal}`);
+      if (fatal) {
+        if (/timeout/i.test(fatal) && this.stepBatchSizeDown()) {
+          index -= batch.length;
+          this.log(`GraphQL reported a timeout; halving batch to ${this.batchSize}`);
+          continue;
+        }
+        throw new Error(`GraphQL enrichment failed: ${fatal}`);
+      }
 
       const decoded = decodeGraphQlUsers(body, batch);
       users.push(...decoded.users);
@@ -464,6 +550,18 @@ export class GitHubClient implements GitHubApi {
   }
 
   /**
+   * Walk down the 100 -> 50 -> 25 ladder. Returns false at the bottom, so a
+   * genuine failure still surfaces instead of looping forever on a batch size
+   * that was never the problem.
+   */
+  private stepBatchSizeDown(): boolean {
+    const next = GRAPHQL_BATCH_LADDER.find((size) => size < this.batchSize);
+    if (next === undefined) return false;
+    this.batchSize = next;
+    return true;
+  }
+
+  /**
    * The documented cost of this query is a guess until the API answers; let the
    * measurement set the batch size so a heavier-than-expected selection shrinks
    * batches instead of exhausting the hourly budget halfway through a tier.
@@ -471,9 +569,21 @@ export class GitHubClient implements GitHubApi {
   private async adaptBatchSize(limit: RateLimitInfo | null, batchSize: number): Promise<void> {
     if (!limit) return;
 
-    const costPerLogin = Math.max(limit.cost, 1) / Math.max(batchSize, 1);
-    const target = Math.round(GRAPHQL_TARGET_COST / costPerLogin);
-    this.batchSize = Math.max(GRAPHQL_BATCH_MIN, Math.min(GRAPHQL_BATCH_MAX, target));
+    // Cost is per query, not per login. One point for a hundred logins is the
+    // expected shape; if the API bills more, shrink so a single request never
+    // costs more than GRAPHQL_TARGET_COST points.
+    const measured = Math.max(limit.cost, 1);
+    const affordable = Math.floor((batchSize * GRAPHQL_TARGET_COST) / measured);
+    this.batchSize = Math.max(
+      GRAPHQL_BATCH_MIN,
+      Math.min(GRAPHQL_BATCH_MAX, Math.max(affordable, GRAPHQL_BATCH_MIN)),
+    );
+
+    if (limit.nodeCount && limit.nodeCount > 400_000) {
+      // The hard ceiling is 500,000 nodes per query; back off before hitting it.
+      this.batchSize = Math.max(GRAPHQL_BATCH_MIN, Math.floor(this.batchSize / 2));
+      this.log(`node count ${limit.nodeCount} near the 500k cap; batch now ${this.batchSize}`);
+    }
 
     if (limit.remaining > GRAPHQL_RESERVE) return;
 
@@ -484,6 +594,7 @@ export class GitHubClient implements GitHubApi {
 
   private async request(url: string, init: RequestInit): Promise<unknown> {
     let lastError = "";
+    const conditional = init.method !== "POST" ? this.etags?.get(url) : undefined;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       const response = await this.fetchImpl(url, {
@@ -493,10 +604,21 @@ export class GitHubClient implements GitHubApi {
           authorization: `Bearer ${this.token}`,
           "user-agent": USER_AGENT,
           ...(init.method === "POST" ? { "content-type": "application/json" } : {}),
+          ...(conditional ? { "if-none-match": conditional } : {}),
         },
       });
 
-      if (response.ok) return response.json();
+      // Unchanged, and it cost us nothing. NOT_MODIFIED is a success.
+      if (response.status === 304) {
+        this.conditionalHits++;
+        return NOT_MODIFIED;
+      }
+
+      if (response.ok) {
+        const etag = response.headers.get("etag");
+        if (etag && init.method !== "POST") this.etags?.set(url, etag);
+        return response.json();
+      }
 
       const text = await response.text();
       lastError = `HTTP ${response.status}: ${text.slice(0, 300)}`;
@@ -516,6 +638,13 @@ export class GitHubClient implements GitHubApi {
 
     throw new Error(`${url} — gave up after ${MAX_ATTEMPTS} attempts. ${lastError}`);
   }
+}
+
+/** GitHub reports query timeouts inconsistently — as a 502, as a plain socket
+ *  timeout, or as a GraphQL error naming it. Match all three. */
+export function isTimeout(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|timed out|ETIMEDOUT|502|504/i.test(message);
 }
 
 /** The trailing year the contribution calendar covers, ending on `date`. */

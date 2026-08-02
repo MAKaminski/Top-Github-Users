@@ -30,12 +30,58 @@ export interface PlaceState {
 export interface CrawlState {
   version: number;
   places: Record<string, PlaceState>;
+  /**
+   * ETags keyed by request URL. A REST response that comes back 304 does not
+   * count against the primary rate limit, so on a re-crawl of mostly-unchanged
+   * data this store is what makes the pass nearly free. Persisted next to the
+   * records it describes, per the standing rules.
+   */
+  etags: Record<string, string>;
+  /**
+   * GH Archive hours already folded into discovery, so a re-run pulls only the
+   * new ones instead of redownloading the whole window. Values are the event
+   * count observed, which also lets a run report coverage.
+   */
+  archiveHours: Record<string, number>;
 }
 
 const FRESH: PlaceState = { lastCrawledAt: null, cursor: 1, done: false };
 
 export function emptyState(): CrawlState {
-  return { version: STATE_VERSION, places: {} };
+  return { version: STATE_VERSION, places: {}, etags: {}, archiveHours: {} };
+}
+
+/**
+ * A ConditionalStore backed by the persisted state, so ETags survive a run.
+ * Handed to GitHubClient; nothing else should touch `state.etags` directly.
+ */
+export function conditionalStore(state: CrawlState) {
+  return {
+    get: (key: string) => state.etags[key],
+    set: (key: string, etag: string) => {
+      state.etags[key] = etag;
+    },
+  };
+}
+
+/** Hours not yet folded in, newest first. */
+export function pendingHours(state: CrawlState, hours: string[]): string[] {
+  return hours.filter((hour) => !(hour in state.archiveHours));
+}
+
+export function recordHour(state: CrawlState, hour: string, events: number): void {
+  state.archiveHours[hour] = events;
+}
+
+/**
+ * Old hours fall out of every window we would ever ask for, and the state file
+ * is committed to git — left unbounded it would grow a line a day forever.
+ */
+export function pruneHours(state: CrawlState, keep: number): void {
+  const hours = Object.keys(state.archiveHours).sort();
+  for (const hour of hours.slice(0, Math.max(0, hours.length - keep))) {
+    delete state.archiveHours[hour];
+  }
 }
 
 export async function readState(dataDir: string = DATA_DIR): Promise<CrawlState> {
@@ -51,7 +97,14 @@ export async function readState(dataDir: string = DATA_DIR): Promise<CrawlState>
     // A state file from an older layout is discarded rather than migrated: the
     // worst case is one wasted re-crawl, and the snapshot itself is untouched.
     if (parsed.version !== STATE_VERSION || typeof parsed.places !== "object") return emptyState();
-    return { version: STATE_VERSION, places: parsed.places ?? {} };
+    return {
+      version: STATE_VERSION,
+      places: parsed.places ?? {},
+      // Added after v1 shipped. Absent in an older file is not a reason to
+      // discard the cursors — just start those maps empty.
+      etags: parsed.etags ?? {},
+      archiveHours: parsed.archiveHours ?? {},
+    };
   } catch {
     return emptyState();
   }
