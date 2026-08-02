@@ -56,6 +56,29 @@ jobs:
             exit 1
           fi
 
+  # A standalone diagnostic, cheap enough to run whenever the API is behaving
+  # strangely: one point for the viewer check, one or two more for a SINGLE-user
+  # enrichment using the exact selection hydration sends. No discovery in front
+  # of it, so it answers in under a minute instead of after a 3.5 GB download.
+  verify:
+    needs: token
+    if: github.event_name == 'workflow_dispatch' && inputs.tier == 'verify'
+    name: verify (token and a one-user enrichment)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=verify
+
   # Discovery reads GH Archive, which is public object storage — no token, and
   # therefore deliberately NOT gated on the `token` job. It can run even when the
   # crawl secret is missing, which is exactly when knowing the candidate set is
