@@ -13,7 +13,9 @@
     "crawl": "tsx scripts/crawler/index.ts",
     "crawl:fixtures": "tsx scripts/crawler/index.ts --fixtures",
     "seed": "tsx scripts/bootstrap-seed.ts",
-    "test": "node --test --experimental-strip-types \"scripts/**/*.test.ts\""
+    "test": "node --test --experimental-strip-types \"scripts/**/*.test.ts\"",
+    "build:index": "tsx scripts/build-index.ts",
+    "prebuild": "tsx scripts/build-index.ts"
   },
   "dependencies": {
     "d3-array": "^3.2.4",

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "headers": [
+    {
+      "source": "/api/(.*)",
+      "headers": [
+        { "key": "access-control-allow-origin", "value": "*" },
+        { "key": "access-control-allow-methods", "value": "GET, OPTIONS" },
+        { "key": "access-control-allow-headers", "value": "content-type" }
+      ]
+    }
+  ]
+}

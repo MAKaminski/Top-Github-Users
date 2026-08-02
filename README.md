@@ -107,6 +107,53 @@ needed by the crawler, offline.
   centroids for the tile map), `motion.ts` (easing/duration constants mirroring the CSS
   tokens).
 
+## Machine-readable surfaces
+
+The snapshot is not only a website. The same data is served three ways, all from one shared
+query layer (`lib/api/queries.ts`) so the surfaces cannot drift apart.
+
+### MCP server — `POST /api/mcp`
+
+A Model Context Protocol server over the snapshot, living inside the Next app, so deploying the
+site deploys the server.
+
+```
+claude mcp add --transport http commitgraph https://<domain>/api/mcp
+```
+
+JSON-RPC 2.0, protocol `2025-06-18`, no authentication, `GET` returns 405. It is hand-rolled
+(`lib/mcp/`) rather than built on `@modelcontextprotocol/sdk`: the SDK's HTTP transport expects
+Node `req`/`res` rather than the Web `Request`/`Response` a route handler receives, and its
+released versions pin zod 3 while this project runs zod 4. Zod 4's `z.toJSONSchema()` generates
+each tool's advertised `inputSchema` from the very schema that validates the call, so the two
+cannot disagree.
+
+Twelve tools. Start with `commitgraph_describe_dataset` — it returns the snapshot date, every
+count, the meaning and provenance of every field, and the full list of valid scope ids. Then
+`commitgraph_search_developers`, `commitgraph_get_developer`, `commitgraph_get_leaderboard`,
+`commitgraph_compare_developers`, `commitgraph_list_places`, `commitgraph_get_organizations`,
+`commitgraph_get_repositories`, `commitgraph_get_rank_history`, `commitgraph_get_statistics`,
+`commitgraph_get_flagged_accounts`, and `commitgraph_get_integration_guide`.
+
+Four resources: `commitgraph://policy`, `commitgraph://manifest`, `commitgraph://schema` (JSON
+Schema generated from `lib/schema.ts`) and `commitgraph://leaderboard/worldwide`.
+
+### REST — `GET /api/v1`
+
+The same data for clients that do not speak MCP. `/api/v1` describes itself; `/api/openapi.json`
+is the OpenAPI 3.1 document.
+
+### Discovery
+
+`/.well-known/mcp.json` points at the MCP endpoint and names its tools; `/llms.txt` orients an
+agent in plain text, caveats included.
+
+### Search index
+
+Search has to see every ranked developer, but they live across 88 country files and 119 city
+files. `scripts/build-index.ts` flattens them into `data/index/search.json` — one read instead
+of 207. It runs automatically as `prebuild`.
+
 ## Design system
 
 Motion patterns come from the public **rejouice-patterns** MCP server at

@@ -70,7 +70,11 @@ interface SourceUser {
 function clean(value: string | undefined | null): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
-  if (!trimmed || trimmed === "undefined value" || trimmed === "undefined") return null;
+  // The upstream encodes absence as the literal "undefined value", and profiles
+  // themselves carry placeholder junk. These leak straight into the API and the
+  // page as a company called "NULL" unless they are dropped here.
+  if (!trimmed) return null;
+  if (/^(undefined value|undefined|null|nil|none|n\/?a|-+|\.+|,+)$/i.test(trimmed)) return null;
   return trimmed;
 }
 
