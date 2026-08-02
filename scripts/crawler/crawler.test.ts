@@ -414,9 +414,13 @@ test("the batch ladder walks all the way down to the client's own floor", async 
   // not be served at 25 gave up with three viable sizes untried — and took a
   // whole run's worth of hydrated users down with it.
   const sizes: number[] = [];
+  let clock = 0;
   const client = new GitHubClient({
     token: "t",
-    sleepImpl: async () => {},
+    sleepImpl: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
     fetchImpl: async (_url, init) => {
       const body = JSON.parse(String((init as RequestInit).body)) as { variables: object };
       // One variable is `from`, one is `to`; the rest are aliases.
@@ -448,9 +452,13 @@ test("a batch nobody can serve is dead-lettered, and the run carries on", async 
   const recorded: { unit: string; attempts: number }[] = [];
   let call = 0;
 
+  let clock = 0;
   const client = new GitHubClient({
     token: "t",
-    sleepImpl: async () => {},
+    sleepImpl: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
     deadLetter: {
       record: async (unit, _error, attempts) => {
         recorded.push({ unit, attempts });

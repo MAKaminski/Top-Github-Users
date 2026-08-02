@@ -72,15 +72,26 @@ const GRAPHQL_RESERVE = 200;
 const MAX_ATTEMPTS = 5;
 
 /**
- * Gateway errors get more patience than other failures.
+ * Gateway errors get more attempts than other failures, but not more time.
  *
- * A 502/504 is not billed against the rate limit, so retrying one costs time
- * and nothing else — and GitHub's GraphQL front end returns them both for a
- * genuine wobble and for a query it decided was too expensive. Five attempts
- * over thirty seconds is too little to ride out the first and too little to
- * distinguish it from the second.
+ * A 502/504 is not billed against the rate limit, so retrying one costs only
+ * time — which is exactly the resource that then needs bounding. The first
+ * version of this raised the attempt count and left the 60-second backoff
+ * ceiling alone, and a probe spent twenty minutes on two thousand users without
+ * reporting anything: eight attempts backing off to a minute is ~3 minutes per
+ * rung, five rungs is ~15 minutes per batch, and three batches before the
+ * circuit breaker is three quarters of an hour to learn one fact.
+ *
+ * Attempts are therefore capped by a wall-clock deadline as well. A gateway
+ * that has not recovered in {@link REQUEST_DEADLINE_MS} is not going to inside
+ * a retry loop, and the batch ladder is a better answer than more waiting.
  */
 const MAX_GATEWAY_ATTEMPTS = 8;
+/** Ceiling on one request's total wall clock, retries included. */
+const REQUEST_DEADLINE_MS = 45_000;
+/** Gateway retries back off fast — they are free, and the useful signal is
+ *  whether the *next* rung down works, not whether a longer wait helps. */
+const GATEWAY_BACKOFF_CEILING_MS = 8_000;
 
 /**
  * Consecutive dead-lettered batches before the run gives up entirely.
@@ -533,8 +544,11 @@ export interface ClientOptions {
    *  Omit and such a batch is dropped with a log line but no record. */
   deadLetter?: DeadLetterSink;
   /** Injected so a test can exercise the retry and batch-ladder paths without
-   *  actually waiting out the backoff. Production never sets it. */
+   *  actually waiting out the backoff. Production never sets it — and when a
+   *  test replaces `sleepImpl`, `now` has to advance with it or the wall-clock
+   *  deadline never fires. */
   sleepImpl?: (ms: number) => Promise<unknown>;
+  now?: () => number;
   log?: (message: string) => void;
 }
 
@@ -555,6 +569,7 @@ export class GitHubClient implements GitHubApi {
   etags?: ConditionalStore;
   deadLetter?: DeadLetterSink;
   sleep: (ms: number) => Promise<unknown>;
+  now: () => number;
   /** Counts requests served from a 304, for the per-run budget report. */
   conditionalHits = 0;
   log: (message: string) => void;
@@ -568,6 +583,7 @@ export class GitHubClient implements GitHubApi {
     this.etags = options.etags;
     this.deadLetter = options.deadLetter;
     this.sleep = options.sleepImpl ?? sleep;
+    this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
     this.searchLimiter = new TokenBucket(SEARCH_REQUESTS_PER_MINUTE);
     this.batchSize = GRAPHQL_BATCH_START;
@@ -817,6 +833,8 @@ export class GitHubClient implements GitHubApi {
   private async request(url: string, init: RequestInit): Promise<unknown> {
     let lastError = "";
     let attempts = 0;
+    let sawGateway = false;
+    const startedAt = this.now();
     const conditional = init.method !== "POST" ? this.etags?.get(url) : undefined;
 
     // Grows to MAX_GATEWAY_ATTEMPTS the first time a 502/503/504 is seen, so a
@@ -862,11 +880,24 @@ export class GitHubClient implements GitHubApi {
       const shouldRetry = transient || isSecondaryLimit(response.status, text) || advised !== null;
 
       if (!shouldRetry) throw new Error(`${url} — ${lastError}`);
-      if (transient) budget = MAX_GATEWAY_ATTEMPTS;
+      if (transient) {
+        budget = MAX_GATEWAY_ATTEMPTS;
+        sawGateway = true;
+      }
 
-      const waitMs = advised ?? backoffMs(attempt);
+      // Attempts left, but no time left. Stop here so the caller can try a
+      // smaller batch instead of waiting out a gateway that is not recovering.
+      const elapsed = this.now() - startedAt;
+      if (elapsed > REQUEST_DEADLINE_MS) {
+        throw new Error(
+          `${url} — gave up after ${attempts} attempts in ${Math.round(elapsed / 1000)}s. ${lastError}`,
+        );
+      }
+
+      const ceiling = sawGateway && advised === null ? GATEWAY_BACKOFF_CEILING_MS : MAX_BACKOFF_MS;
+      const waitMs = Math.min(advised ?? backoffMs(attempt), ceiling);
       this.log(`retrying ${new URL(url).pathname} in ${Math.ceil(waitMs / 1000)}s — ${lastError}`);
-      await this.sleep(Math.min(waitMs, MAX_BACKOFF_MS));
+      await this.sleep(waitMs);
     }
 
     throw new Error(`${url} — gave up after ${attempts} attempts. ${lastError}`);
