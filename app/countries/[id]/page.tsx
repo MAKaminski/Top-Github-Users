@@ -90,10 +90,23 @@ export default async function CountryPage({ params }: { params: Promise<{ id: st
           <LeaderboardHeader />
           <ViewportStaggerReveal>
             {board.entries.map((entry) => (
-              <LeaderboardRow key={entry.login} entry={entry} />
+              <LeaderboardRow key={entry.login} entry={entry} sparkline={false} />
             ))}
           </ViewportStaggerReveal>
         </div>
+
+        {/* This page is a ranked head, not the whole country. Search carries the
+            tail, because it reads the index rather than this board file. */}
+        <p className="prose mt-[var(--space-md)] text-caption text-muted">
+          Showing the top {exact(board.entries.length)} in {place.name}.{" "}
+          <Link
+            href={`/search?country=${place.id}&sort=contributions`}
+            className="underline underline-offset-4"
+          >
+            Search every tracked developer here
+          </Link>
+          , including those ranked below this page.
+        </p>
       </section>
 
       <section className="shell border-t border-rule py-[var(--space-lg)]">

@@ -80,8 +80,19 @@ import { assertWithinBudget, estimateBudget, formatBudget } from "./budget.ts";
  * states the depth publicly.
  */
 const WORLDWIDE_SIZE = 250_000;
-const USERS_PER_COUNTRY = 25_000;
-const USERS_PER_CITY = 5_000;
+
+/**
+ * Place boards are sized to what a page can render, not to what the crawl can
+ * collect. `/countries/[id]` renders every entry it is given, so a 25,000-row
+ * board is 25,000 rows of HTML on each of 88 statically-generated pages. The
+ * worldwide board escapes this because it is the one route with an infinite
+ * scroll and a jump-to-rank.
+ *
+ * The tail is not lost: every hydrated developer carries `countryId` and
+ * `cityId` in the search index, so `/search?country=india` covers all of them.
+ */
+const USERS_PER_COUNTRY = 1_000;
+const USERS_PER_CITY = 250;
 
 /** How many discovered candidates a hydration pass will pay for. Keep it equal
  *  to WORLDWIDE_SIZE: hydrating names that cannot reach any board is budget
@@ -94,8 +105,15 @@ const HYDRATE_LIMIT = WORLDWIDE_SIZE;
  * The day-by-day calendar is the expensive selection (371 nodes per login), so
  * it is bought for the depth that has a page to show it on and estimated below
  * that. Every estimate is labelled wherever it appears.
+ *
+ * The binding constraint is **build time**, not budget: `/u/[login]` has
+ * `generateStaticParams` over every profile, so this number is literally the
+ * number of pages the site builds. 2,529 profiles is a couple of minutes;
+ * 50,000 would not finish inside a Vercel build. Everyone below this depth is
+ * still ranked, searchable and linked — out to github.com rather than to a page
+ * we did not build.
  */
-const PROFILE_DEPTH = 50_000;
+const PROFILE_DEPTH = 10_000;
 
 /** Rows per board file once a board outgrows a single reviewable JSON file. */
 const BOARD_SHARD_SIZE = 25_000;

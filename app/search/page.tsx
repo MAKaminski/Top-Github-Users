@@ -32,6 +32,7 @@ export default async function SearchPage({
 
   const query = read("q");
   const country = read("country");
+  const city = read("city");
   const company = read("company");
   const minFollowers = Number(read("minFollowers")) || undefined;
   const offset = Math.max(0, Number(read("offset")) || 0);
@@ -43,8 +44,12 @@ export default async function SearchPage({
 
   const [manifest, results] = await Promise.all([
     getManifest(),
-    query || country || company || minFollowers
-      ? searchDevelopers({ query, countryId: country, company, minFollowers, sort }, PAGE, offset)
+    query || country || city || company || minFollowers
+      ? searchDevelopers(
+          { query, countryId: country, cityId: city, company, minFollowers, sort },
+          PAGE,
+          offset,
+        )
       : Promise.resolve(null),
   ]);
 
@@ -53,6 +58,7 @@ export default async function SearchPage({
     const base: Record<string, string | number | undefined> = {
       q: query,
       country,
+      city,
       company,
       minFollowers,
       sort: sort === "contributions" ? undefined : sort,

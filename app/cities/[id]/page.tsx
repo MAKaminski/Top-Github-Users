@@ -82,10 +82,20 @@ export default async function CityPage({ params }: { params: Promise<{ id: strin
           <LeaderboardHeader />
           <ViewportStaggerReveal>
             {board.entries.map((entry) => (
-              <LeaderboardRow key={entry.login} entry={entry} />
+              <LeaderboardRow key={entry.login} entry={entry} sparkline={false} />
             ))}
           </ViewportStaggerReveal>
         </div>
+
+        {/* A ranked head, like the country pages. Search reads the index and so
+            covers everyone this file leaves out. */}
+        <p className="prose mt-[var(--space-md)] text-caption text-muted">
+          Showing the top {exact(board.entries.length)} in {place.name}.{" "}
+          <Link href={`/search?city=${place.id}`} className="underline underline-offset-4">
+            Search every tracked developer here
+          </Link>
+          .
+        </p>
       </section>
     </>
   );
