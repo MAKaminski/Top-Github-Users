@@ -65,18 +65,21 @@ import {
   writeState,
 } from "./state.ts";
 import { discover, filterCandidates, recentHours } from "./gharchive.ts";
-import { assertWithinBudget, estimateBudget, formatBudget } from "./budget.ts";
+import { assertWithinBudget, estimateBudget, formatBudget, POINTS_PER_HOUR } from "./budget.ts";
 import { DeadLetter } from "./limiter.ts";
 
 /**
  * Board depths.
  *
  * These were 500 / 150 / 75, sized for a search-driven pipeline where every
- * extra name cost a request against a 30-per-minute limit. Hydration now comes
- * from GH Archive discovery at roughly one GraphQL point per hundred logins, so
- * the binding constraint moved from rate limit to repository size: 250,000
+ * extra name cost a request against a 30-per-minute limit. Discovery is free now
+ * (GH Archive), so the two constraints that remain are repository size — 250,000
  * developers is about 26 MB of committed index, which git handles; a million is
- * not, and would be rewritten on every crawl.
+ * not, and would be rewritten on every crawl — and how many logins GitHub will
+ * aggregate a year of contributions for inside one query. See PROBE_SIZES: that
+ * ceiling is measured, and it is far below the hundred-per-point CLAUDE.md §1
+ * assumes for scalar batches, so reaching this depth takes days of hourly runs
+ * accumulating through the hydration journal rather than a single pass.
  *
  * Raising these is a data decision, not a tuning knob. See /methodology, which
  * states the depth publicly.
@@ -116,6 +119,50 @@ const HYDRATE_LIMIT = WORLDWIDE_SIZE;
  * we did not build.
  */
 const PROFILE_DEPTH = 10_000;
+
+/**
+ * The alias counts the `verify` tier walks, and the accounts it walks them with.
+ *
+ * CLAUDE.md §1 says a batched `user()` query costs one point per hundred logins.
+ * That is true of the scalar fields; it is *not* true of `contributionsCollection`,
+ * which makes GitHub aggregate a year of events per alias inside one query's
+ * execution budget. Points were never the binding constraint — wall clock inside
+ * a single query is, and GitHub reports overrunning it as a gateway 502 rather
+ * than as a structured error. So the ceiling has to be measured, and re-measured
+ * whenever it seems to have moved.
+ *
+ * The logins are long-lived, heavily active accounts on purpose: they are close
+ * to the worst case for a year's aggregation, so a size that works here works on
+ * the corpus. `felixonmars` currently tops our own board.
+ */
+const PROBE_SIZES = [1, 2, 3, 5, 10, 25] as const;
+const PROBE_LOGINS = [
+  "torvalds",
+  "felixonmars",
+  "sindresorhus",
+  "gaearon",
+  "yyx990803",
+  "jonschlinkert",
+  "addyosmani",
+  "mrdoob",
+  "kennethreitz",
+  "tj",
+  "bagder",
+  "rui314",
+  "wesbos",
+  "ry",
+  "antirez",
+  "mitchellh",
+  "kentcdodds",
+  "isaacs",
+  "gvanrossum",
+  "JakeWharton",
+  "mattn",
+  "hadley",
+  "dhh",
+  "bradfitz",
+  "tpope",
+];
 
 /** Rows per board file once a board outgrows a single reviewable JSON file. */
 const BOARD_SHARD_SIZE = 25_000;
@@ -1293,25 +1340,51 @@ export async function run(options: Options, dataDir: string = DATA_DIR): Promise
       });
       await client.verifyToken();
 
-      // Then the query hydration actually sends, for exactly one user. If this
-      // fails while the viewer check passed, the problem is the enrichment
-      // query or the account — not the batch size, and not the token.
-      const probe = await client.probeEnrichment(
-        "torvalds",
-        contributionWindow(new Date(`${context.date}T00:00:00Z`)),
-      );
-      console.log(
-        `  … single-alias enrichment: ${probe.ok ? "OK" : "FAILED"} · ` +
-          `cost ${probe.cost ?? "?"} · contributions ${probe.total ?? "?"} · ${probe.detail}`,
-      );
-      if (!probe.ok) {
+      // Then the query hydration actually sends, at one alias count after
+      // another. A previous run showed 100/50/25/10/5 all returning gateway
+      // 502s while a single alias answered in a second, so the working ceiling
+      // is somewhere in between and every schedule estimate depends on which
+      // rung it sits on. Measure it (§8) rather than assume it.
+      const window = contributionWindow(new Date(`${context.date}T00:00:00Z`));
+      const working: number[] = [];
+      let consecutiveFailures = 0;
+
+      for (const size of PROBE_SIZES) {
+        const probe = await client.probeEnrichment(PROBE_LOGINS.slice(0, size), window);
+        console.log(
+          `  … ${String(size).padStart(3)} aliases: ${probe.ok ? "OK    " : "FAILED"} · ` +
+            `cost ${probe.cost ?? "?"} · ${Math.round(probe.elapsedMs / 100) / 10}s · ${probe.detail}`,
+        );
+        if (probe.ok) {
+          working.push(size);
+          consecutiveFailures = 0;
+          continue;
+        }
+        // Keep walking past one failure — a single gateway wobble is not a
+        // ceiling — but stop after two in a row rather than spending the job
+        // proving that 50 and 100 still do not work.
+        if (++consecutiveFailures >= 2) {
+          console.log("  … two consecutive failures; treating the last success as the ceiling");
+          break;
+        }
+      }
+
+      if (!working.length) {
         throw new Error(
-          "The token is accepted but a ONE-user enrichment query still failed. That rules out " +
+          "The token is accepted but even a ONE-user enrichment query failed. That rules out " +
             "batch size, query weight and credentials. Remaining causes are account-level " +
             "secondary limiting or a GitHub-side problem with contributionsCollection — " +
             "neither is fixed by re-running.",
         );
       }
+
+      const ceiling = Math.max(...working);
+      const perHour = POINTS_PER_HOUR * ceiling;
+      console.log(
+        `  … largest alias count GitHub served: ${ceiling}\n` +
+          `  … that is ~${perHour.toLocaleString()} users/hr, so ${WORLDWIDE_SIZE.toLocaleString()} ` +
+          `takes ~${Math.ceil(WORLDWIDE_SIZE / perHour)} hrs of budget`,
+      );
       return;
     }
     case "discover":

@@ -611,48 +611,82 @@ export class GitHubClient implements GitHubApi {
   }
 
   /**
-   * One user, one alias, the same selection hydration uses.
+   * N users in one query, using the same selection hydration uses.
    *
-   * This exists to answer a single question that cost a lot to guess at: when
+   * This exists to answer a question that cost a lot to guess at: when
    * enrichment 502s, is it the *size* of the batch or the query itself? A run
    * walked 100 -> 50 -> 25 -> 10 -> 5 with the light selection and took gateway
-   * errors at every rung while `{ viewer { login } }` answered fine, which
-   * points away from volume — but only a one-alias request settles it.
+   * errors at every rung while a one-alias request answered in a second. So the
+   * ceiling sits somewhere below 5, and the only honest way to find it is to
+   * ask GitHub one alias count at a time.
+   *
+   * Deliberately impatient: two attempts, not the eight a hydrating batch gets.
+   * A probe that rides out a gateway wobble reports the wrong ceiling, and a
+   * size that needs three tries to answer is not a size we can run 250,000
+   * users through anyway.
    *
    * Returns the measured cost so the §8 budget can stop being an assumption.
    */
   async probeEnrichment(
-    login: string,
+    logins: string[],
     window: ContributionWindow,
-  ): Promise<{ ok: boolean; cost: number | null; total: number | null; detail: string }> {
+  ): Promise<{
+    size: number;
+    ok: boolean;
+    cost: number | null;
+    resolved: number;
+    elapsedMs: number;
+    detail: string;
+  }> {
+    const startedAt = this.now();
+    const variables: Record<string, string> = { from: window.from, to: window.to };
+    logins.forEach((login, index) => {
+      variables[aliasFor(index)] = login;
+    });
+
+    const failure = (detail: string) => ({
+      size: logins.length,
+      ok: false,
+      cost: null,
+      resolved: 0,
+      elapsedMs: this.now() - startedAt,
+      detail,
+    });
+
     try {
-      const body = (await this.request(GRAPHQL_ENDPOINT, {
-        method: "POST",
-        body: JSON.stringify({
-          query: buildUserQuery(1, { languages: false, calendar: false }),
-          variables: { from: window.from, to: window.to, [aliasFor(0)]: login },
-        }),
-      })) as GraphQLBody;
+      const body = (await this.request(
+        GRAPHQL_ENDPOINT,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            query: buildUserQuery(logins.length, { languages: false, calendar: false }),
+            variables,
+          }),
+        },
+        { maxAttempts: 2 },
+      )) as GraphQLBody;
 
       const fatal = fatalGraphQlError(body);
-      if (fatal) return { ok: false, cost: null, total: null, detail: `GraphQL error: ${fatal}` };
+      if (fatal) return failure(`GraphQL error: ${fatal}`);
 
-      const decoded = decodeGraphQlUsers(body, [login]);
-      const user = decoded.users[0];
+      const decoded = decodeGraphQlUsers(body, logins);
       const limit = rateLimitFrom(body);
       return {
-        ok: Boolean(user),
+        size: logins.length,
+        // Every alias has to come back. A partial answer at size 10 is not a
+        // working size 10 — it is a size we would have to dead-letter half of.
+        ok: decoded.users.length === logins.length,
         cost: limit?.cost ?? null,
-        total: user?.contributionsCollection.contributionCalendar.totalContributions ?? null,
-        detail: user ? `@${login} resolved` : `@${login} did not resolve`,
+        resolved: decoded.users.length,
+        elapsedMs: this.now() - startedAt,
+        detail:
+          decoded.users.length === logins.length
+            ? `all ${logins.length} resolved`
+            : `only ${decoded.users.length}/${logins.length} resolved` +
+              (decoded.skipped.length ? ` (skipped ${decoded.skipped.join(", ")})` : ""),
       };
     } catch (error) {
-      return {
-        ok: false,
-        cost: null,
-        total: null,
-        detail: error instanceof Error ? error.message : String(error),
-      };
+      return failure(error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -876,7 +910,11 @@ export class GitHubClient implements GitHubApi {
     await this.sleep(waitMs);
   }
 
-  private async request(url: string, init: RequestInit): Promise<unknown> {
+  private async request(
+    url: string,
+    init: RequestInit,
+    retry: { maxAttempts?: number } = {},
+  ): Promise<unknown> {
     let lastError = "";
     let attempts = 0;
     let sawGateway = false;
@@ -886,7 +924,7 @@ export class GitHubClient implements GitHubApi {
     // Grows to MAX_GATEWAY_ATTEMPTS the first time a 502/503/504 is seen, so a
     // flaky front end gets ridden out without giving every other failure the
     // same latitude.
-    let budget = MAX_ATTEMPTS;
+    let budget = retry.maxAttempts ?? MAX_ATTEMPTS;
 
     for (let attempt = 0; attempt < budget; attempt++) {
       attempts = attempt + 1;
@@ -927,7 +965,7 @@ export class GitHubClient implements GitHubApi {
 
       if (!shouldRetry) throw new Error(`${url} — ${lastError}`);
       if (transient) {
-        budget = MAX_GATEWAY_ATTEMPTS;
+        budget = retry.maxAttempts ?? MAX_GATEWAY_ATTEMPTS;
         sawGateway = true;
       }
 

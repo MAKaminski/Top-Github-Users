@@ -517,6 +517,85 @@ test("a batch nobody can serve is dead-lettered, and the run carries on", async 
   assert.ok(!result.users.some((user) => user.login === "poison"));
 });
 
+test("the probe reports a size as working only when every alias comes back", async () => {
+  // The probe exists to set the hydration batch size, so "mostly worked" is the
+  // one answer it must never give: a size that resolves 6 of 10 would send the
+  // corpus pass into dead-lettering 40% of it while reporting success.
+  const asked: number[] = [];
+  let clock = 0;
+  const client = new GitHubClient({
+    token: "t",
+    sleepImpl: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit).body)) as {
+        variables: Record<string, string>;
+      };
+      const aliases = Object.keys(body.variables).filter((key) => key !== "from" && key !== "to");
+      asked.push(aliases.length);
+
+      // Three aliases is the pretend ceiling: above it GitHub answers with the
+      // gateway error a query-execution timeout actually produces, and at it the
+      // last alias comes back null the way a deleted account does.
+      if (aliases.length > 3) return new Response("gateway timeout", { status: 502 });
+
+      return Response.json({
+        data: Object.fromEntries([
+          ["rateLimit", { cost: 1, limit: 5000, remaining: 4999, resetAt: "", nodeCount: 1 }],
+          ...aliases.map((alias, index) => [
+            alias,
+            index === aliases.length - 1 && aliases.length === 3
+              ? null
+              : {
+                  login: body.variables[alias],
+                  name: null,
+                  avatarUrl: "",
+                  location: null,
+                  company: null,
+                  bio: null,
+                  followers: { totalCount: 1 },
+                  repositories: { totalCount: 1 },
+                  contributionsCollection: {
+                    totalCommitContributions: 1,
+                    totalPullRequestContributions: 0,
+                    totalIssueContributions: 0,
+                    totalPullRequestReviewContributions: 0,
+                    restrictedContributionsCount: 0,
+                    contributionCalendar: { totalContributions: 1 },
+                  },
+                },
+          ]),
+        ]),
+      });
+    },
+  });
+
+  const window = { from: "a", to: "b" };
+  const logins = ["a", "b", "c", "d", "e"];
+
+  const two = await client.probeEnrichment(logins.slice(0, 2), window);
+  assert.equal(two.ok, true);
+  assert.equal(two.resolved, 2);
+
+  const three = await client.probeEnrichment(logins.slice(0, 3), window);
+  assert.equal(three.ok, false, "a partial answer is not a working size");
+  assert.match(three.detail, /only 2\/3 resolved/);
+
+  const five = await client.probeEnrichment(logins, window);
+  assert.equal(five.ok, false);
+  assert.match(five.detail, /502/);
+
+  // Impatient on purpose: eight attempts would let a wobbling gateway pass for
+  // a working size, and would make the six-rung sweep take most of the job.
+  assert.equal(
+    asked.filter((size) => size === 5).length,
+    2,
+    "a failing size is tried twice, not eight times",
+  );
+});
+
 test("a user hydrated without days gets no calendar rather than an empty one", () => {
   const scalarOnly = {
     login: "scalars",
