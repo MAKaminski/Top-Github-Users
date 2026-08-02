@@ -1286,8 +1286,32 @@ export async function run(options: Options, dataDir: string = DATA_DIR): Promise
     // A one-point preflight, so a rejected credential fails at the top of the
     // job rather than after 3.5 GB of archive download and a printed budget.
     case "verify": {
-      const client = new GitHubClient({ token: requireToken(), log: (m) => console.log(`  … ${m}`) });
+      const client = new GitHubClient({
+        token: requireToken(),
+        languages: false,
+        log: (m) => console.log(`  … ${m}`),
+      });
       await client.verifyToken();
+
+      // Then the query hydration actually sends, for exactly one user. If this
+      // fails while the viewer check passed, the problem is the enrichment
+      // query or the account — not the batch size, and not the token.
+      const probe = await client.probeEnrichment(
+        "torvalds",
+        contributionWindow(new Date(`${context.date}T00:00:00Z`)),
+      );
+      console.log(
+        `  … single-alias enrichment: ${probe.ok ? "OK" : "FAILED"} · ` +
+          `cost ${probe.cost ?? "?"} · contributions ${probe.total ?? "?"} · ${probe.detail}`,
+      );
+      if (!probe.ok) {
+        throw new Error(
+          "The token is accepted but a ONE-user enrichment query still failed. That rules out " +
+            "batch size, query weight and credentials. Remaining causes are account-level " +
+            "secondary limiting or a GitHub-side problem with contributionsCollection — " +
+            "neither is fixed by re-running.",
+        );
+      }
       return;
     }
     case "discover":

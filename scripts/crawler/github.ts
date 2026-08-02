@@ -610,6 +610,52 @@ export class GitHubClient implements GitHubApi {
     return login;
   }
 
+  /**
+   * One user, one alias, the same selection hydration uses.
+   *
+   * This exists to answer a single question that cost a lot to guess at: when
+   * enrichment 502s, is it the *size* of the batch or the query itself? A run
+   * walked 100 -> 50 -> 25 -> 10 -> 5 with the light selection and took gateway
+   * errors at every rung while `{ viewer { login } }` answered fine, which
+   * points away from volume — but only a one-alias request settles it.
+   *
+   * Returns the measured cost so the §8 budget can stop being an assumption.
+   */
+  async probeEnrichment(
+    login: string,
+    window: ContributionWindow,
+  ): Promise<{ ok: boolean; cost: number | null; total: number | null; detail: string }> {
+    try {
+      const body = (await this.request(GRAPHQL_ENDPOINT, {
+        method: "POST",
+        body: JSON.stringify({
+          query: buildUserQuery(1, { languages: false, calendar: false }),
+          variables: { from: window.from, to: window.to, [aliasFor(0)]: login },
+        }),
+      })) as GraphQLBody;
+
+      const fatal = fatalGraphQlError(body);
+      if (fatal) return { ok: false, cost: null, total: null, detail: `GraphQL error: ${fatal}` };
+
+      const decoded = decodeGraphQlUsers(body, [login]);
+      const user = decoded.users[0];
+      const limit = rateLimitFrom(body);
+      return {
+        ok: Boolean(user),
+        cost: limit?.cost ?? null,
+        total: user?.contributionsCollection.contributionCalendar.totalContributions ?? null,
+        detail: user ? `@${login} resolved` : `@${login} did not resolve`,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        cost: null,
+        total: null,
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
   async searchUsers(query: string, options: SearchOptions = {}): Promise<SearchUser[]> {
     return this.searchPaged(`${API_ROOT}/search/users`, query, "followers", options, (body) =>
       decodeSearchUsers(body),
