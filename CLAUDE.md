@@ -207,6 +207,28 @@ have — an explicit empty state beats placeholder data.
 on serialise (`writeJson` in `scripts/lib/io.ts`), ties broken by `login`, and no timestamps inside
 per-record files — a single `generatedAt` lives in the manifest.
 
+## Shipping — standing authorization
+
+The user has granted this once, durably. **Do not ask again.**
+
+- **Push without asking.** Work goes to the designated feature branch as soon as it is verified.
+  Verified means: `npx tsc --noEmit` clean, `npx eslint .` with no errors, `pnpm build` succeeding,
+  the unit suites passing, and — for anything touching the site — `node tests/shots.mjs` still
+  clean across all 11 routes. Failing checks are the only thing that holds a push.
+- **Open the pull request without asking.** Immediately after the first push of a branch, open a
+  **draft** PR if no open one exists. Keep pushing follow-up commits to the same branch and the
+  same PR rather than opening a second one.
+- **Then subscribe** to the PR's activity and drive it to green: diagnose and fix CI failures,
+  address review comments, and reply when something genuinely cannot be fixed. Do not end a
+  CI-failure notification without either a pushed fix or a posted explanation.
+- **Still ask before:** force-pushing over someone else's commits, changing the repository's
+  default branch, merging a PR, deleting anything, or any action that reaches outside this
+  repository. Authorization to push and open PRs is not authorization to merge.
+
+`main` is the base branch. If it does not exist, create it from an empty root commit and rebase the
+feature branch onto it, so the PR shows a reviewable diff instead of failing with
+`422 base: invalid`.
+
 **Commands:** `pnpm seed` (bootstrap snapshot), `pnpm crawl` (real pipeline),
 `pnpm build:index` (search index, runs as prebuild), `pnpm build`, `node tests/shots.mjs`
 (accessibility sweep), `node --test tests/mcp.test.mjs` (MCP contract).
