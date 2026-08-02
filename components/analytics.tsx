@@ -50,13 +50,22 @@ export function Analytics() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const [consent, setConsent] = useState<Consent | null>(null);
+  // Whether the stored decision has been read yet.
+  //
+  // Without this the banner is in the server-rendered HTML — `consent` is null
+  // during render, and null means "not yet answered" — so it paints on every
+  // navigation and only disappears once hydration runs the effect below. A
+  // visitor who answered months ago sees it flash on every page. `localStorage`
+  // is unreadable on the server, so the honest state before mount is "unknown",
+  // and the only correct thing to render for an unknown answer is nothing.
+  const [ready, setReady] = useState(false);
   const started = useRef(false);
 
   // Read the stored decision once, after mount. Reading during render would
   // make the server and client markup disagree.
   useEffect(() => {
-    if (!ANALYTICS_ENABLED) return;
-    setConsent(readConsent());
+    if (ANALYTICS_ENABLED) setConsent(readConsent());
+    setReady(true);
   }, []);
 
   useEffect(() => {
@@ -76,7 +85,7 @@ export function Analytics() {
     });
   }, [pathname, searchParams, consent]);
 
-  if (!ANALYTICS_ENABLED || consent !== null) return null;
+  if (!ready || !ANALYTICS_ENABLED || consent !== null) return null;
 
   return (
     <ConsentBanner

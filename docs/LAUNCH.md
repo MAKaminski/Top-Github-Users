@@ -159,6 +159,69 @@ not.
 
 ---
 
+## Video / Loom
+
+Product Hunt wants a **link**, not a file, so the upload is a two-minute manual step. The
+recording itself is generated:
+
+```bash
+pnpm build && pnpm start          # one shell
+node tests/launch-video.mjs       # another
+```
+
+Produces `launch-media/commitgraph-demo.webm` — 1920x1080, 25fps, ~65 seconds, ~7 MB. It
+is a scripted tour of the running site with the motion design intact (the gallery
+screenshots suppress motion; the video deliberately does not, because the motion is part
+of what is being shown).
+
+**Upload it to YouTube and paste that link.** YouTube accepts webm directly, so no
+transcoding is needed. Loom is a recorder rather than a host for existing files — if you
+want a Loom specifically, record your own voice-over walkthrough, which will outperform
+this silent tour anyway. A maker talking over their own product is the single most
+effective asset on Product Hunt.
+
+There is no `.mp4` because Playwright bundles a deliberately minimal ffmpeg — VP8 and webm
+only, no H.264 — so this environment cannot transcode. If a destination needs mp4:
+
+```bash
+ffmpeg -i commitgraph-demo.webm -c:v libx264 -preset slow -crf 20 \
+       -pix_fmt yuv420p -movflags +faststart commitgraph-demo.mp4
+```
+
+### Shot list
+
+| At | Scene | Point being made |
+| --- | --- | --- |
+| 0:00 | Worldwide leaderboard | Opens on the product, not on a logo. A viewer who leaves at five seconds has still seen what this is. |
+| 0:11 | Sort by followers | The ordering is a URL — shareable, reloadable, works without JavaScript |
+| 0:18 | A profile | 371-day heatmap, streak rings, and the caption saying which parts are estimated |
+| 0:31 | Countries | 88 countries as a tile-grid map |
+| 0:41 | Methodology | The differentiator: a page saying where the numbers are wrong |
+| 0:52 | Home | Closes on the claim |
+
+## Interactive demo
+
+Arcade, Storylane, Supademo and the rest are free for Product Hunt launches but all
+require an account and a browser extension to capture, so the hosted link has to be made
+by you. What is generated here is everything that goes *into* one: the step images already
+exist as the gallery PNGs, and the hotspot copy is below.
+
+Import `01`–`06` from `launch-media/` in order and attach one hotspot per step:
+
+| Step | Image | Hotspot on | Tooltip |
+| --- | --- | --- | --- |
+| 1 | `02-leaderboard.png` | The `SORT` row | Every developer in the snapshot, sortable three ways. Sorting is a URL, so any view is shareable. |
+| 2 | `02-leaderboard.png` | A `≈` streak value | The `≈` means estimated rather than measured. Nothing on this site presents an estimate as a fact. |
+| 3 | `03-profile.png` | The heatmap | A real 371-day contribution calendar — the shape of someone's year, not just their total. |
+| 4 | `04-countries.png` | The tile map | 88 countries and 119 cities, from the free-text location people put on their own profile. |
+| 5 | `06-methodology.png` | The first heading | The page no other ranking site has: exactly what is counted, and where it is wrong. |
+| 6 | `01-hero.png` | The stat row | Free, no signup, and a REST and MCP API over the same snapshot. |
+
+If you would rather skip the third-party tool entirely, the field accepts any URL — a
+short YouTube link works in both places, and one good video beats a mediocre click-through.
+
+---
+
 ## Answers worth having ready
 
 **"How is this different from committers.top / gitstar-ranking?"**

@@ -349,9 +349,11 @@ The short version; the full account is on `/methodology`.
 | `build:index` | `tsx scripts/build-index.ts` | Rebuilds the search index; runs automatically as `prebuild` |
 | `test` | `node --test "scripts/**/*.test.ts"` | 49 pipeline unit tests, all offline |
 
-Two Playwright scripts are deliberately not in `package.json`, because both need a server
-already running: `node tests/shots.mjs` (the accessibility sweep) and
-`node tests/launch-media.mjs` (regenerates the Product Hunt gallery from the live site).
+Three Playwright scripts are deliberately not in `package.json`, because all of them need a
+server already running: `node tests/shots.mjs` (the accessibility sweep),
+`node tests/launch-media.mjs` (regenerates the Product Hunt gallery) and
+`node tests/launch-video.mjs` (records the 65-second demo tour). The two launch scripts
+photograph the live site, so their output always matches whatever the site is serving.
 
 ## Licence and attribution
 
