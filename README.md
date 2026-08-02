@@ -50,15 +50,26 @@ dataset into this project's schema so a fresh clone renders real rankings immedi
 It writes `source: "bootstrap"` into the manifest, and the site surfaces that on
 `/methodology` with attribution. It fetches 75 users per country, keeps a city only
 where at least 8 tracked developers agree on the name, and generates profile pages for
-the worldwide top 500 plus each place's leaders.
+the worldwide top 500 plus each place's leaders. It is a starting point, not the
+intended source — the crawler below replaces it.
 
-**Scheduled crawler** — `scripts/crawler/`, run by `pnpm crawl`. This is the project's
-intended long-term source: it talks to the GitHub API directly, fetches real 371-day
-contribution calendars and language breakdowns rather than estimating them, and
-replaces the bootstrap snapshot wholesale on its first successful run. *It is not in
-this tree yet* — the `crawl` and `crawl:fixtures` scripts in `package.json` reference
-`scripts/crawler/index.ts`, which has not been committed. Today the seeder is the only
-working source.
+**Scheduled crawler** — `scripts/crawler/`, run by `pnpm crawl`. The project's intended
+long-term source. It replaces the bootstrap snapshot wholesale on its first successful
+run, and it works in four stages:
+
+| Tier | Cost | What it does |
+| --- | --- | --- |
+| `discover` | **free** | Streams a rolling 7-day window of [GH Archive](https://www.gharchive.org/) and ranks every actor by public authorship events. No token, no API budget. Measured here: 4 hours = 63,444 distinct actors in 8.8 seconds. |
+| `hydrate` | ~2,500 GraphQL points | Fetches the filtered head of that list at 100 aliases a query, then **derives** the worldwide, country and city boards by grouping one hydrated set. |
+| `calendars` | the expensive one | Buys the 371-day contribution calendar — 371 nodes per login — only for the depth that has a profile page. Everyone below keeps a labelled estimate. |
+| `supplement` | search budget | Follower- and location-ordered search, for developers whose work is almost entirely private and who therefore emit no public events. Contributes *names* for the next hydration; publishes no board. |
+
+The corpus is capped at **250,000 developers**. That is a storage decision, not an API
+one: snapshots are committed to git so each can be diffed against the day before, and
+the GraphQL budget would comfortably stretch further.
+
+The crawler needs a `GH_CRAWL_TOKEN` repository secret — a classic PAT with **no
+scopes** is enough, since everything it reads is public.
 
 **Where snapshots live** — everything under `data/`, committed as JSON so any ranking
 can be diffed against the day before it:
@@ -152,7 +163,13 @@ agent in plain text, caveats included.
 
 Search has to see every ranked developer, but they live across 88 country files and 119 city
 files. `scripts/build-index.ts` flattens them into `data/index/search.json` — one read instead
-of 207. It runs automatically as `prebuild`.
+of 207 — plus `data/index/order.json`, three arrays of row indices so serving any sorted page
+is a slice rather than a sort. Both run automatically as `prebuild`.
+
+Rows are stored as **array tuples**, not objects, and the avatar is a numeric account id
+rather than a URL. That took a row from 377 bytes to 105 — the difference between 250,000
+developers being 94 MB and being ~26 MB, which is the difference between the index fitting in
+git and in a serverless function and not.
 
 ## Design system
 
@@ -247,10 +264,10 @@ The short version; the full account is on `/methodology`.
 | `start` | `next start` | Serves the production build |
 | `lint` | `eslint .` | Flat config in `eslint.config.mjs` (`eslint-config-next`) |
 | `typecheck` | `tsc --noEmit` | TypeScript, `strict` |
-| `crawl` | `tsx scripts/crawler/index.ts` | Scheduled GitHub crawler — **not yet committed** |
-| `crawl:fixtures` | `tsx scripts/crawler/index.ts --fixtures` | Crawler against recorded fixtures — **not yet committed** |
+| `crawl` | `tsx scripts/crawler/index.ts` | Scheduled GitHub crawler. Pick a stage with `--tier=discover\|hydrate\|calendars\|supplement` |
+| `crawl:fixtures` | `tsx scripts/crawler/index.ts --fixtures` | The whole pipeline against recorded fixtures — no network, no token |
 | `seed` | `tsx scripts/bootstrap-seed.ts` | Builds the bootstrap snapshot into `data/` |
-| `test` | `node --test "scripts/**/*.test.ts"` | Unit tests for the pipeline — **no test files yet** |
+| `test` | `node --test "scripts/**/*.test.ts"` | 42 pipeline unit tests, all offline |
 
 The Playwright sweep is not in `package.json`; run it directly with `node tests/shots.mjs`.
 

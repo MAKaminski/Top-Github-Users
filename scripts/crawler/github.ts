@@ -117,7 +117,8 @@ export interface GraphUser {
     restrictedContributionsCount: number;
     contributionCalendar: {
       totalContributions: number;
-      weeks: ContributionWeek[];
+      /** Absent on a scalars-only pass — see {@link EnrichOptions.calendar}. */
+      weeks?: ContributionWeek[];
     };
   };
 }
@@ -139,10 +140,43 @@ export interface SearchOptions {
   max?: number;
 }
 
+export interface EnrichOptions {
+  /**
+   * Whether to request the day-by-day contribution calendar.
+   *
+   * This is the field that decides what a hydration pass costs. Everything else
+   * in the selection is a scalar; `weeks { contributionDays { … } }` is 371
+   * nodes *per alias*, so a 100-alias batch asks for 37,100 of them and the
+   * measured `rateLimit.cost` climbs accordingly. Hydrating a large corpus runs
+   * in two passes: scalars for everyone, days only for the depth that has a
+   * profile page to show them on.
+   *
+   * `contributionCalendar { totalContributions }` is kept either way. It is one
+   * scalar, and it is the authoritative twelve-month total — the per-type counts
+   * beneath it are public-only and do not sum to it, so dropping it would mean
+   * ranking on a number GitHub does not agree with.
+   *
+   * Defaults to true, which is what every place-scoped tier wants.
+   */
+  calendar?: boolean;
+  /**
+   * Called after each batch is decoded.
+   *
+   * Lets a caller persist as it goes rather than holding a quarter of a million
+   * records until the end — the standing rules require a resumable job, and a
+   * run that only writes at the end is not one.
+   */
+  onBatch?: (batch: EnrichResult & { index: number }) => void | Promise<void>;
+}
+
 export interface GitHubApi {
   searchUsers(query: string, options?: SearchOptions): Promise<SearchUser[]>;
   searchRepositories(query: string, options?: SearchOptions): Promise<SearchRepository[]>;
-  enrichUsers(logins: string[], window: ContributionWindow): Promise<EnrichResult>;
+  enrichUsers(
+    logins: string[],
+    window: ContributionWindow,
+    options?: EnrichOptions,
+  ): Promise<EnrichResult>;
 }
 
 /**
@@ -341,13 +375,27 @@ export function fatalGraphQlError(body: GraphQLBody): string | null {
   return fatal.length > 0 ? fatal.map((error) => error.message ?? error.type).join("; ") : null;
 }
 
-/** The enrichment document, built for however many logins are in this batch. */
-export function buildUserQuery(count: number, options: { languages?: boolean } = {}): string {
+/**
+ * The enrichment document, built for however many logins are in this batch.
+ *
+ * `calendar: false` drops the only connection field in the selection. What is
+ * left is scalars, so the query bills at the shape the batching maths assumes —
+ * about one point per hundred logins — and a corpus-wide pass is affordable.
+ * With the calendar in, each alias adds 371 nodes and the same batch costs
+ * several times as much. Both are legitimate; they are different passes.
+ */
+export function buildUserQuery(
+  count: number,
+  options: { languages?: boolean; calendar?: boolean } = {},
+): string {
   const repositories = options.languages
     ? "repositories(first: 25, isFork: false, ownerAffiliations: OWNER, " +
       "orderBy: { field: STARGAZERS, direction: DESC }) " +
       "{ totalCount nodes { primaryLanguage { name } } }"
     : "repositories { totalCount }";
+
+  const days =
+    options.calendar === false ? "" : "\n        weeks { contributionDays { date contributionCount } }";
 
   const params = ["$from: DateTime!", "$to: DateTime!"];
   const fields: string[] = [];
@@ -371,8 +419,7 @@ export function buildUserQuery(count: number, options: { languages?: boolean } =
       totalPullRequestReviewContributions
       restrictedContributionsCount
       contributionCalendar {
-        totalContributions
-        weeks { contributionDays { date contributionCount } }
+        totalContributions${days}
       }
     }
   }`,
@@ -495,9 +542,15 @@ export class GitHubClient implements GitHubApi {
     return out.slice(0, max);
   }
 
-  async enrichUsers(logins: string[], window: ContributionWindow): Promise<EnrichResult> {
+  async enrichUsers(
+    logins: string[],
+    window: ContributionWindow,
+    options: EnrichOptions = {},
+  ): Promise<EnrichResult> {
     const users: GraphUser[] = [];
     const skipped: string[] = [];
+    const collect = options.onBatch === undefined;
+    let batchIndex = 0;
 
     for (let index = 0; index < logins.length; ) {
       const batch = logins.slice(index, index + this.batchSize);
@@ -513,7 +566,10 @@ export class GitHubClient implements GitHubApi {
         body = (await this.request(GRAPHQL_ENDPOINT, {
           method: "POST",
           body: JSON.stringify({
-            query: buildUserQuery(batch.length, { languages: this.languages }),
+            query: buildUserQuery(batch.length, {
+              languages: this.languages,
+              calendar: options.calendar,
+            }),
             variables,
           }),
         })) as GraphQLBody;
@@ -540,8 +596,16 @@ export class GitHubClient implements GitHubApi {
       }
 
       const decoded = decodeGraphQlUsers(body, batch);
-      users.push(...decoded.users);
-      skipped.push(...decoded.skipped);
+      // With a per-batch consumer the caller owns the records and this method
+      // holds nothing: that is what lets a 250,000-login pass run in bounded
+      // memory and resume from where it stopped.
+      if (collect) {
+        users.push(...decoded.users);
+        skipped.push(...decoded.skipped);
+      } else {
+        await options.onBatch?.({ ...decoded, index: batchIndex });
+      }
+      batchIndex++;
 
       await this.adaptBatchSize(rateLimitFrom(body), batch.length);
     }

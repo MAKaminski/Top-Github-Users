@@ -1,7 +1,7 @@
 import { CAVEATS } from "@/lib/api/caveats";
 import { CORS_HEADERS, baseUrlFrom, handle } from "@/lib/api/http";
 import { getManifest } from "@/lib/api/queries";
-import { loadSearchIndex } from "@/lib/api/search-index";
+import { loadIndexTable } from "@/lib/api/search-index";
 
 /**
  * /llms.txt — the plain-text brief for a model that lands on this domain.
@@ -13,9 +13,11 @@ import { loadSearchIndex } from "@/lib/api/search-index";
 
 export function GET(request: Request): Promise<Response> {
   return handle(async () => {
-    const [manifest, rows] = await Promise.all([getManifest(), loadSearchIndex()]);
+    const [manifest, table] = await Promise.all([getManifest(), loadIndexTable()]);
     const base = baseUrlFrom(request);
-    const withProfile = rows.filter((row) => row.hasProfile).length;
+
+    let withProfile = 0;
+    for (let i = 0; i < table.count; i++) if (table.hasProfileAt(i)) withProfile++;
 
     // Interpolated sentences are assembled on one line each: a template literal
     // would otherwise wrap them wherever the source happens to break, which puts
@@ -30,7 +32,7 @@ export function GET(request: Request): Promise<Response> {
     ].join(" ");
 
     const coverage = [
-      `Profile coverage in this snapshot: ${count(withProfile)} of the ${count(rows.length)}`,
+      `Profile coverage in this snapshot: ${count(withProfile)} of the ${count(table.count)}`,
       "logins in the search index have a stored profile record. The rest are present as",
       "leaderboard rows only, and a lookup for one of them returns the row plus a note rather",
       "than a 404.",

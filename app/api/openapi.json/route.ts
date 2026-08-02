@@ -92,6 +92,19 @@ const SCHEMAS: Record<string, unknown> = {
       cityId: nullable("string"),
       previousRank: { ...nullable("integer"), description: "Null until a second snapshot exists." },
       hasProfile: { type: "boolean", description: "False when only the leaderboard row is stored." },
+      streak: {
+        ...nullable("object"),
+        description:
+          "Longest and current run of days with at least one contribution, read off the " +
+          "contribution calendar.",
+      },
+      calendarMeasured: {
+        ...nullable("boolean"),
+        description:
+          "False when `streak` was derived from an ESTIMATED calendar rather than a fetched " +
+          "one. Estimates are deterministic and their totals are exact, but the day-by-day " +
+          "shape is inferred. Never present an estimated streak as a measurement.",
+      },
     },
   },
 
@@ -114,6 +127,23 @@ const SCHEMAS: Record<string, unknown> = {
       countryRank: nullable("integer"),
       cityRank: nullable("integer"),
       hasProfile: { type: "boolean" },
+      accountId: {
+        type: "integer",
+        description: "GitHub's numeric account id; 0 when the snapshot does not carry one.",
+      },
+      streak: {
+        ...nullable("object"),
+        description:
+          "Longest and current run of days with at least one contribution, read off the " +
+          "contribution calendar.",
+      },
+      calendarMeasured: {
+        ...nullable("boolean"),
+        description:
+          "False when `streak` was derived from an ESTIMATED calendar rather than a fetched " +
+          "one. Estimates are deterministic and their totals are exact, but the day-by-day " +
+          "shape is inferred. Never present an estimated streak as a measurement.",
+      },
     },
   },
 
@@ -458,13 +488,30 @@ export function GET(request: Request): Promise<Response> {
             summary: "Ranked developers for a scope.",
             description:
               "Scope is `worldwide`, `country:{id}` or `city:{id}`. The colon must be " +
-              "percent-encoded in the path: /api/v1/leaderboard/country%3Ajapan.",
+              "percent-encoded in the path: /api/v1/leaderboard/country%3Ajapan. The worldwide " +
+              "scope covers the ENTIRE snapshot rather than a top-N — read `total` and page " +
+              "with `offset`.",
             parameters: [
               {
                 name: "scope",
                 in: "path",
                 required: true,
                 schema: { type: "string", examples: ["worldwide", "country:japan", "city:jp-tokyo"] },
+              },
+              {
+                name: "sort",
+                in: "query",
+                required: false,
+                description:
+                  "Ranking metric. `streak` reads off the contribution calendar, which is " +
+                  "fetched for the top of the board and estimated below it, so a streak " +
+                  "ranking mixes measured and estimated values — check `calendarMeasured` on " +
+                  "each row. An unrecognised value is a 400, never a silent fallback.",
+                schema: {
+                  type: "string",
+                  enum: ["contributions", "followers", "streak"],
+                  default: "contributions",
+                },
               },
               LIMIT_PARAM,
               OFFSET_PARAM,
@@ -476,6 +523,11 @@ export function GET(request: Request): Promise<Response> {
                   scope: { type: "string" },
                   name: { type: "string" },
                   generatedAt: { type: "string" },
+                  sort: { type: "string", enum: ["contributions", "followers", "streak"] },
+                  streakCaveat: {
+                    type: "string",
+                    description: "Present only when sort=streak; states the provenance mix.",
+                  },
                 }),
               ),
               "400": BAD_REQUEST,
@@ -522,7 +574,7 @@ export function GET(request: Request): Promise<Response> {
                 required: false,
                 schema: {
                   type: "string",
-                  enum: ["contributions", "followers", "rank", "login"],
+                  enum: ["contributions", "followers", "streak", "rank", "login"],
                   default: "contributions",
                 },
               },

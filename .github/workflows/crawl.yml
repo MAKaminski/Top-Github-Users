@@ -14,7 +14,7 @@ on:
     # Off the hour: everything else in the world is scheduled on it, and GitHub
     # queues scheduled runs accordingly.
     - cron: "5 */6 * * *" # 6-hourly — GH Archive discovery (no API budget)
-    - cron: "17 3 * * *" # daily   — worldwide + the largest countries
+    - cron: "17 3 * * *" # daily   — hydrate the discovered corpus, then calendars
     - cron: "43 4 * * 0" # weekly  — remaining countries, organisations, repositories
     - cron: "11 5 1 * *" # monthly — cities
   workflow_dispatch:
@@ -22,8 +22,8 @@ on:
       tier:
         description: Tier to run
         type: choice
-        default: worldwide
-        options: [discover, worldwide, countries, cities, orgs, repos]
+        default: hydrate
+        options: [discover, hydrate, calendars, supplement, countries, cities, orgs, repos]
       shard:
         description: "Shard, as N/M — countries and cities only"
         type: string
@@ -80,10 +80,72 @@ jobs:
       - name: Commit
         run: .github/scripts/commit-data.sh discover
 
-  worldwide:
+  # The main pass. Reads the candidate list discovery already wrote and turns it
+  # into every board, at 100 aliases a GraphQL query. Scalars only: the
+  # day-by-day calendar is 371 nodes per login and belongs to the job below.
+  hydrate:
     needs: token
-    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'worldwide')
-    name: worldwide
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'hydrate')
+    name: hydrate (scalars, whole corpus)
+    runs-on: ubuntu-latest
+    # Well inside the 6-hour job ceiling: the printed budget refuses anything
+    # that cannot finish, so a timeout here means the estimate was wrong, which
+    # is worth failing loudly for.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # candidates.json is gitignored — it is regenerated in seconds and is an
+      # intermediate, not a snapshot — so this job produces its own.
+      - name: Discover candidates from GH Archive
+        run: pnpm crawl --tier=discover
+      - name: Hydrate
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=hydrate ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      - name: Commit
+        run: .github/scripts/commit-data.sh hydrate
+
+  # The expensive selection, bought only for the depth that has a profile page.
+  # Runs after hydration because it reads the board hydration just wrote.
+  calendars:
+    needs: [token, hydrate]
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'calendars')
+    name: calendars (measured, profile depth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Fetch calendars
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=calendars ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      - name: Commit
+        run: .github/scripts/commit-data.sh calendars
+
+  # The supplementary search pass. GH Archive only records *public* activity, so
+  # a developer working almost entirely in private repositories never appears in
+  # it; this is the pass that finds them. Weekly, not daily — it is capped at
+  # 1,000 results per query and costs search budget that hydration does not.
+  supplement:
+    needs: token
+    if: github.event.schedule == '43 4 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'supplement')
+    name: supplement (search for mostly-private accounts)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -99,14 +161,18 @@ jobs:
       - name: Crawl
         env:
           GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
-        run: pnpm crawl --tier=worldwide ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+        run: pnpm crawl --tier=supplement
       - name: Commit
-        run: .github/scripts/commit-data.sh worldwide
+        run: .github/scripts/commit-data.sh supplement
 
+  # Moved off the daily cron when hydration started deriving country boards by
+  # grouping the hydrated set. Running both on the same day would have the
+  # shallow search-derived board (150 rows, capped by the search API) overwrite
+  # the derived one (up to 25,000) a few minutes later.
   countries_daily:
     needs: token
-    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'countries' && inputs.shard == '')
-    name: countries (daily set)
+    if: github.event.schedule == '43 4 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'countries' && inputs.shard == '')
+    name: countries (supplementary search, head of list)
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:

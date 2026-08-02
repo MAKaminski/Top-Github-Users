@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { FullscreenMenuOverlay } from "./fullscreen-menu-overlay";
 import { NAV_LINKS } from "@/components/nav-links";
+import { SearchBox } from "@/components/search-box";
 
 /**
  * condensing-sticky-nav — starts tall and open, condenses to a compact strip
@@ -59,6 +60,11 @@ export function CondensingStickyNav() {
             />
             Commitgraph
           </Link>
+
+          {/* Sits between the wordmark and the links so it is reachable from
+              every route without competing with the primary navigation for
+              width on a narrow viewport, where it collapses into the overlay. */}
+          <SearchBox className="hidden w-[16rem] xl:block" />
 
           <ul className="hidden items-center gap-[var(--space-md)] lg:flex">
             {NAV_LINKS.map((link) => {

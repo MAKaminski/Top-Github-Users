@@ -1,15 +1,22 @@
 /**
  * Crawler entry point.
  *
- *   pnpm crawl --tier=countries --shard=2/6 --limit=20
- *   pnpm crawl:fixtures            # offline, recorded responses
+ *   pnpm crawl --tier=discover              # free: GH Archive, no API budget
+ *   pnpm crawl --tier=hydrate               # the corpus, batched GraphQL
+ *   pnpm crawl --tier=calendars             # the expensive field, profile depth
+ *   pnpm crawl --tier=countries --shard=2/6 # supplementary name collection
+ *   pnpm crawl:fixtures                     # offline, recorded responses
  *
- * The work is split into tiers because the places differ wildly in how fast
- * they change and how much budget they cost: the worldwide board and the large
- * countries are worth a daily pass, the long tail of countries a weekly one,
- * cities monthly. Each tier is independently shardable so a GitHub Actions
- * matrix can run several in parallel without any of them fighting over the
- * search rate limit.
+ * The pipeline is discover -> filter -> hydrate -> derive. Discovery reads GH
+ * Archive and costs nothing; hydration pays for the filtered head of it at 100
+ * aliases a GraphQL query; every board — worldwide, country, city — is then
+ * *derived* by grouping that one hydrated set, which is why none of them carry
+ * the search API's 1,000-result ceiling any more.
+ *
+ * The search-based tiers survive for the one thing the event stream cannot do:
+ * find developers whose work is almost entirely private. They contribute names
+ * to a supplementary pool that the next hydration pays for, and publish no
+ * board of their own.
  *
  * A run never crawls more than its budget allows. Where it stopped is recorded
  * in `data/_state.json`, and the next run resumes from there — see state.ts.
@@ -19,7 +26,8 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { writeJson, DATA_DIR } from "../lib/io.ts";
-import { COUNTRIES, COUNTRY_BY_SLUG, type CountryDef } from "../lib/countries.ts";
+import { COUNTRIES, COUNTRY_BY_SLUG } from "../lib/countries.ts";
+import { parseCity } from "../lib/city.ts";
 import type {
   Leaderboard,
   LeaderboardEntry,
@@ -36,12 +44,10 @@ import {
   GitHubClient,
   SEARCH_RESULT_CAP,
   type GitHubApi,
-  type SearchUser,
 } from "./github.ts";
 import { loadFixtureClient } from "./fixtures.ts";
 import {
   assignRanks,
-  byEntryRank,
   shardOf,
   toLeaderboardEntry,
   toRankedUser,
@@ -60,18 +66,42 @@ import {
 import { discover, filterCandidates, recentHours } from "./gharchive.ts";
 import { assertWithinBudget, estimateBudget, formatBudget } from "./budget.ts";
 
-/** Board depths. Larger than the seeder's — the crawler pays for its own data
- *  and can afford to keep more of it. */
-const WORLDWIDE_SIZE = 500;
-const USERS_PER_COUNTRY = 150;
-const USERS_PER_CITY = 75;
+/**
+ * Board depths.
+ *
+ * These were 500 / 150 / 75, sized for a search-driven pipeline where every
+ * extra name cost a request against a 30-per-minute limit. Hydration now comes
+ * from GH Archive discovery at roughly one GraphQL point per hundred logins, so
+ * the binding constraint moved from rate limit to repository size: 250,000
+ * developers is about 26 MB of committed index, which git handles; a million is
+ * not, and would be rewritten on every crawl.
+ *
+ * Raising these is a data decision, not a tuning knob. See /methodology, which
+ * states the depth publicly.
+ */
+const WORLDWIDE_SIZE = 250_000;
+const USERS_PER_COUNTRY = 25_000;
+const USERS_PER_CITY = 5_000;
+
+/** How many discovered candidates a hydration pass will pay for. Keep it equal
+ *  to WORLDWIDE_SIZE: hydrating names that cannot reach any board is budget
+ *  spent on rows nobody will ever see. */
+const HYDRATE_LIMIT = WORLDWIDE_SIZE;
+
+/**
+ * Profile pages, and therefore fetched calendars.
+ *
+ * The day-by-day calendar is the expensive selection (371 nodes per login), so
+ * it is bought for the depth that has a page to show it on and estimated below
+ * that. Every estimate is labelled wherever it appears.
+ */
+const PROFILE_DEPTH = 50_000;
+
+/** Rows per board file once a board outgrows a single reviewable JSON file. */
+const BOARD_SHARD_SIZE = 25_000;
 const MIN_USERS_FOR_CITY = 8;
 const TOP_REPOSITORIES = 120;
 const TOP_ORGANIZATIONS = 120;
-
-/** Profile pages exist for the worldwide list plus each place's leaders. */
-const PROFILE_COUNTRY_DEPTH = 25;
-const PROFILE_CITY_DEPTH = 10;
 
 /**
  * `scripts/lib/countries.ts` is written largest developer population first, so
@@ -85,7 +115,9 @@ const FRESHNESS: Record<Tier, number> = {
   // Discovery costs no API budget, so it can run as often as the archive
   // publishes. Its own hour cache is what stops it redoing work.
   discover: 0,
-  worldwide: 1,
+  hydrate: 1,
+  calendars: 1,
+  supplement: 7,
   countries: 1,
   cities: 25,
   orgs: 6,
@@ -122,7 +154,16 @@ const DEFAULT_MIN_EVENTS = 5;
  */
 const ARCHIVE_HOURS_RETAINED = DEFAULT_ARCHIVE_HOURS * 2;
 
-const TIERS = ["discover", "worldwide", "countries", "cities", "orgs", "repos"] as const;
+const TIERS = [
+  "discover",
+  "hydrate",
+  "calendars",
+  "supplement",
+  "countries",
+  "cities",
+  "orgs",
+  "repos",
+] as const;
 export type Tier = (typeof TIERS)[number];
 
 interface Shard {
@@ -144,7 +185,7 @@ export interface Options {
 export function parseOptions(argv: string[]): Options {
   const options: Options = {
     fixtures: false,
-    tier: "worldwide",
+    tier: "hydrate",
     shard: null,
     limit: null,
     hours: DEFAULT_ARCHIVE_HOURS,
@@ -278,54 +319,6 @@ async function writeProfileIndex(context: Context): Promise<void> {
 
 // ---- Crawling -------------------------------------------------------------
 
-interface PlaceTarget {
-  /** State key and, for countries and cities, the file name of the board. */
-  key: string;
-  name: string;
-  query: string;
-  country: CountryDef | null;
-  /** Cities only: keep just the users whose parsed city is actually this one. */
-  cityId?: string;
-}
-
-/**
- * Search for a place, enrich everyone it found, and return ranked users.
- * Flagged accounts are separated here rather than filtered later so the caller
- * can publish them on /methodology instead of dropping them on the floor.
- */
-async function crawlPlace(
-  context: Context,
-  target: PlaceTarget,
-  depth: number,
-): Promise<{ users: RankedUser[]; flagged: RankedUser[]; skipped: string[] }> {
-  // Search can only order by followers, and we rank by contributions, so the
-  // candidate pool has to be several times the board depth for the ordering to
-  // survive the change of metric. Three times is where the extra enrichment
-  // stops buying new names in practice.
-  const found: SearchUser[] = await context.api.searchUsers(target.query, {
-    max: Math.min(SEARCH_RESULT_CAP, Math.max(depth * 3, 100)),
-  });
-
-  const avatars = new Map(found.map((user) => [user.login, user.avatarUrl]));
-  const window = contributionWindow(new Date(`${context.date}T00:00:00Z`));
-  const enriched = await context.api.enrichUsers(
-    found.map((user) => user.login),
-    window,
-  );
-
-  const mapped = enriched.users
-    .map((user) =>
-      toRankedUser(user, { country: target.country, avatarUrl: avatars.get(user.login) }),
-    )
-    .filter((user) => user.contributions.total > 0)
-    .filter((user) => !target.cityId || user.cityId === target.cityId);
-
-  return {
-    users: mapped.filter((user) => !user.flagged),
-    flagged: mapped.filter((user) => user.flagged),
-    skipped: enriched.skipped,
-  };
-}
 
 /** Writes a place's board, its profiles and its history in one go. */
 async function publishPlace(
@@ -382,65 +375,70 @@ async function publishPlace(
 // ---- Tiers ----------------------------------------------------------------
 
 /**
- * The worldwide board is the union of every place we hold, re-ranked. Search
- * offers no global "most contributions" ordering, so the tier also refreshes
- * the most-followed accounts — the one global ordering it does offer — to catch
- * developers whose location string names no country we track.
+ * The supplementary search pass.
+ *
+ * GH Archive is a record of *public events*, so a developer who works almost
+ * entirely in private repositories never appears in it no matter how much they
+ * commit. Search is the only way to find those accounts, and `followers:` is
+ * the one global ordering it offers.
+ *
+ * It deliberately does **not** publish a board any more. It used to, and that
+ * was the bug: a search capped at 1,000 results per query cannot describe a
+ * corpus of 250,000, so every run of it silently truncated the board hydration
+ * had just derived. Now it only contributes *names* — written where the next
+ * hydration will pick them up and pay for them properly, alongside everyone
+ * discovery found.
  */
-async function runWorldwide(context: Context, flagged: RankedUser[]): Promise<void> {
-  const global = await crawlPlace(
-    context,
-    {
-      key: "worldwide",
-      name: "Worldwide",
-      query: "followers:>=1000 type:user",
-      country: null,
-    },
-    WORLDWIDE_SIZE,
-  );
-  flagged.push(...global.flagged);
+async function runSupplement(context: Context): Promise<void> {
+  const found = await context.api.searchUsers("followers:>=1000 type:user", {
+    max: SEARCH_RESULT_CAP,
+  });
   context.processed += 1;
 
-  const fresh = new Map<string, LeaderboardEntry>();
-  for (const user of global.users) fresh.set(user.login, toLeaderboardEntry(user, 0));
-
-  // Everything already on disk counts too — a developer ranked 900th in India
-  // belongs on the worldwide board whether or not this run re-crawled them.
-  for (const board of await readBoards(context.dataDir, "country")) {
-    for (const entry of board.entries) {
-      if (!fresh.has(entry.login)) fresh.set(entry.login, entry);
-    }
-  }
-
-  const ordered = [...fresh.values()].sort(byEntryRank).slice(0, WORLDWIDE_SIZE);
-  const onBoard = new Set(ordered.map((entry) => entry.login));
-  await writeProfiles(
+  const total = await mergeSupplementary(
     context,
-    global.users.filter((user) => onBoard.has(user.login)),
+    found.map((user) => ({
+      login: user.login,
+      avatarUrl: user.avatarUrl,
+      // Not from the event stream, so there is no event count to report. Zero
+      // is honest here; `alwaysKeep` is what carries these through the filter.
+      events: 0,
+      repos: 0,
+      lastSeen: context.date,
+    })),
   );
 
-  const previous = previousRanks(await readHistory("worldwide", context.dataDir));
-  const entries = ordered.map((entry, index) => ({
-    ...entry,
-    rank: index + 1,
-    previousRank: previous.get(entry.login) ?? null,
-    hasProfile: context.profiles.has(entry.login),
-  }));
+  console.log(
+    `${found.length} logins from search · ${total} in the supplementary pool ` +
+      `(hydration will fetch them)`,
+  );
+}
 
-  await writeJson(path.join(context.dataDir, "leaderboard", "worldwide.json"), {
-    scope: "worldwide",
-    name: "Worldwide",
+/**
+ * Folds newly-found logins into the supplementary pool.
+ *
+ * A union across runs, not a replacement: search returns at most the first
+ * 1,000 results for any query, so coverage is accumulated over weeks rather
+ * than obtained in one pass. Sorted by login on write, like every other
+ * artefact, so a run that finds nothing new produces no diff.
+ */
+async function mergeSupplementary(context: Context, found: Candidate[]): Promise<number> {
+  const file = path.join(context.dataDir, "discovery", "supplementary.json");
+  const previous = (await readJsonFile<{ logins: Candidate[] }>(file))?.logins ?? [];
+
+  const merged = new Map(previous.map((candidate) => [candidate.login, candidate]));
+  for (const candidate of found) merged.set(candidate.login, candidate);
+
+  await writeJson(file, {
     generatedAt: context.date,
-    entries,
-  } satisfies Leaderboard);
-
-  await updateHistory({
-    file: "worldwide",
-    scope: "worldwide",
-    date: context.date,
-    points: entries.map((entry) => ({ login: entry.login, rank: entry.rank, total: entry.total })),
-    dataDir: context.dataDir,
+    note:
+      "Logins found by search rather than GH Archive, covering developers whose work is mostly " +
+      "private and who therefore emit no public events. Hydration merges these into its " +
+      "candidate list and pays for them there.",
+    logins: [...merged.values()].sort((a, b) => a.login.localeCompare(b.login)),
   });
+
+  return merged.size;
 }
 
 /**
@@ -461,123 +459,79 @@ export function countryTargets(shard: Shard | null): string[] {
   );
 }
 
-async function runCountries(
-  context: Context,
-  shard: Shard | null,
-  flagged: RankedUser[],
-): Promise<string[]> {
-  const state = await readState(context.dataDir);
-  const slugs = countryTargets(shard);
-
-  const touched: string[] = [];
-  for (const slug of orderByStaleness(state, slugs)) {
-    if (outOfBudget(context)) break;
-    if (!isDue(state, slug, FRESHNESS.countries)) continue;
-
-    const country = COUNTRY_BY_SLUG.get(slug);
-    if (!country) continue;
-
-    const result = await crawlPlace(
-      context,
-      { key: slug, name: country.name, query: locationQuery(country.name), country },
-      USERS_PER_COUNTRY,
-    );
-    flagged.push(...result.flagged);
-    context.processed += 1;
-
-    if (result.users.length === 0) {
-      // An empty result is far more likely to be a bad day for the API than a
-      // country that lost every developer, so the existing board stays put.
-      console.warn(`  ! ${slug}: no users returned, keeping the previous board`);
-      continue;
-    }
-
-    await publishPlace(context, {
-      scope: `country:${slug}`,
-      file: path.join("country", `${slug}.json`),
-      name: country.name,
-      users: result.users,
-      rankField: "country",
-      depth: USERS_PER_COUNTRY,
-      profileDepth: PROFILE_COUNTRY_DEPTH,
-      history: `country-${slug}`,
-    });
-
-    recordCompletion(state, slug, context.date);
-    touched.push(slug);
-    console.log(`  ${slug.padEnd(24)} ${String(result.users.length).padStart(4)} users`);
-  }
-
-  await writeState(state, context.dataDir);
-  return touched;
-}
-
 /**
- * City targets come from the manifest rather than a hand-kept list: the places
- * we already know hold developers are exactly the ones worth re-crawling, and
- * new ones arrive through the country tier's parsed locations.
+ * Location-scoped supplementary search.
+ *
+ * These used to *publish* the country and city boards. That stopped being
+ * correct the moment hydration started deriving those boards by grouping the
+ * hydrated corpus: a search is capped at 1,000 results per query, so a run of
+ * this tier would replace a 25,000-row derived board with a 150-row one a few
+ * minutes after it was written.
+ *
+ * What it is still uniquely good for is the gap GH Archive cannot cover —
+ * developers whose work is almost entirely private, who therefore emit no
+ * public events and appear in no archive hour. Search finds them by profile
+ * location. So this collects *names* into the same supplementary pool as the
+ * global follower query, and the next hydration pays for them properly.
  */
-async function runCities(
+async function collectPlaceNames(
   context: Context,
   shard: Shard | null,
-  flagged: RankedUser[],
+  kind: "countries" | "cities",
 ): Promise<string[]> {
-  const manifest = await readJsonFile<Manifest>(path.join(context.dataDir, "manifest.json"));
-  const known = manifest?.cities ?? [];
   const state = await readState(context.dataDir);
 
-  const targets = selectShard(
-    [...known].sort((a, b) => a.id.localeCompare(b.id)),
-    shard,
-  );
-  const byId = new Map(targets.map((city) => [city.id, city]));
+  const targets: { key: string; name: string }[] =
+    kind === "countries"
+      ? countryTargets(shard).flatMap((slug) => {
+          const country = COUNTRY_BY_SLUG.get(slug);
+          return country ? [{ key: slug, name: country.name }] : [];
+        })
+      : selectShard(
+          [
+            ...((await readJsonFile<Manifest>(path.join(context.dataDir, "manifest.json")))
+              ?.cities ?? []),
+          ].sort((a, b) => a.id.localeCompare(b.id)),
+          shard,
+        ).map((city) => ({ key: city.id, name: city.name }));
 
+  const found = new Map<string, Candidate>();
   const touched: string[] = [];
-  for (const id of orderByStaleness(
+
+  for (const target of orderByStaleness(
     state,
-    targets.map((city) => city.id),
+    targets.map((t) => t.key),
   )) {
     if (outOfBudget(context)) break;
-    if (!isDue(state, id, FRESHNESS.cities)) continue;
+    if (!isDue(state, target, FRESHNESS[kind])) continue;
 
-    const city = byId.get(id);
-    const country = city?.countryId ? COUNTRY_BY_SLUG.get(city.countryId) : null;
-    if (!city || !country) continue;
+    const place = targets.find((t) => t.key === target);
+    if (!place) continue;
 
-    const result = await crawlPlace(
-      context,
-      {
-        key: id,
-        name: city.name,
-        query: locationQuery(city.name),
-        country,
-        cityId: id,
-      },
-      USERS_PER_CITY,
-    );
-    flagged.push(...result.flagged);
+    // Search only, no GraphQL: this pass buys names, and hydration buys the
+    // data. Half the cost of the old shape for the half of it that was useful.
+    const users = await context.api.searchUsers(locationQuery(place.name), {
+      max: SEARCH_RESULT_CAP,
+    });
     context.processed += 1;
 
-    // A city that has thinned out below the threshold is dropped from the
-    // manifest by the rebuild below rather than left as a near-empty page.
-    if (result.users.length < MIN_USERS_FOR_CITY) continue;
+    for (const user of users) {
+      found.set(user.login, {
+        login: user.login,
+        avatarUrl: user.avatarUrl,
+        events: 0,
+        repos: 0,
+        lastSeen: context.date,
+      });
+    }
 
-    await publishPlace(context, {
-      scope: `city:${id}`,
-      file: path.join("city", `${id}.json`),
-      name: city.name,
-      users: result.users,
-      rankField: "city",
-      depth: USERS_PER_CITY,
-      profileDepth: PROFILE_CITY_DEPTH,
-    });
-
-    recordCompletion(state, id, context.date);
-    touched.push(id);
-    console.log(`  ${id.padEnd(28)} ${String(result.users.length).padStart(4)} users`);
+    recordCompletion(state, target, context.date);
+    touched.push(target);
+    console.log(`  ${target.padEnd(28)} ${String(users.length).padStart(4)} logins`);
   }
 
   await writeState(state, context.dataDir);
+  await mergeSupplementary(context, [...found.values()]);
   return touched;
 }
 
@@ -768,9 +722,11 @@ async function rebuildManifest(context: Context): Promise<Manifest> {
     generatedAt: context.date,
     source: "crawler",
     sourceNote:
-      "Crawled from the GitHub REST search and GraphQL APIs. Search never returns past the " +
-      "thousandth result per query, so each place is ranked from its top 1000 accounts by " +
-      "followers; the limits are set out on /methodology.",
+      "Candidates discovered from GH Archive's record of public GitHub events, then hydrated " +
+      "through batched GraphQL. Country and city boards are derived by grouping that one " +
+      "hydrated set, so none of them carry the search API's thousand-result ceiling. Day-by-day " +
+      "calendars are fetched for the top of the board and estimated below it; the limits are " +
+      "set out on /methodology.",
     counts: {
       users: people.size,
       countries: countries.length,
@@ -843,6 +799,319 @@ async function writeFlagged(context: Context, found: RankedUser[]): Promise<numb
   return accounts.length;
 }
 
+// ---- Hydration ------------------------------------------------------------
+
+interface CandidateFile {
+  generatedAt: string;
+  window: { hours: number; from: string; to: string };
+  minEvents: number;
+  actorsSeen: number;
+  candidates: Candidate[];
+}
+
+async function readCandidates(context: Context): Promise<CandidateFile> {
+  const file = await readJsonFile<CandidateFile>(
+    path.join(context.dataDir, "discovery", "candidates.json"),
+  );
+  if (!file?.candidates?.length) {
+    throw new Error(
+      "data/discovery/candidates.json is missing or empty. Run `pnpm crawl --tier=discover` " +
+        "first — it costs no API budget and takes minutes. Hydration deliberately refuses to " +
+        "fall back to REST search: that path is capped at 1,000 results per query and is what " +
+        "held the corpus at a few thousand developers.",
+    );
+  }
+  return file;
+}
+
+/**
+ * Hydration — turn discovered logins into ranked developers.
+ *
+ * This is the step that decides how large the site is. Discovery already knows
+ * about far more accounts than the API budget can describe, so the ordering it
+ * produces (public authorship events in the window) is the filter, and only the
+ * head of it is paid for. Everything here runs against §1's batched GraphQL:
+ * 100 aliases a query, one point a query, results consumed per batch so an
+ * interrupted run resumes instead of restarting.
+ *
+ * The calendar is deliberately *not* requested. See {@link EnrichOptions} — it
+ * is the one field that makes a corpus-wide pass unaffordable, and the
+ * `calendars` tier buys it back for the depth that has a page to show it on.
+ */
+async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void> {
+  const file = await readCandidates(context);
+
+  // Everyone the supplementary search found, plus everyone already holding a
+  // profile page. Both are carried through the filter regardless of their event
+  // count: the first group has none by definition, and the second must not fall
+  // off a board because they had a quiet week.
+  const supplementary =
+    (await readJsonFile<{ logins: Candidate[] }>(
+      path.join(context.dataDir, "discovery", "supplementary.json"),
+    ))?.logins ?? [];
+
+  const alwaysKeep = new Set([
+    ...context.profiles,
+    ...supplementary.map((candidate) => candidate.login),
+  ]);
+
+  const pool = new Map<string, Candidate>();
+  for (const candidate of [...file.candidates, ...supplementary]) {
+    if (!pool.has(candidate.login)) pool.set(candidate.login, candidate);
+  }
+
+  const { candidates } = filterCandidates(
+    [...pool.values()].map((candidate) => ({
+      login: candidate.login,
+      id: 0,
+      avatarUrl: candidate.avatarUrl,
+      events: candidate.events,
+      lastSeen: candidate.lastSeen,
+      repos: candidate.repos,
+    })),
+    { minEvents: 1, limit: context.limit ?? HYDRATE_LIMIT, alwaysKeep },
+  );
+
+  if (supplementary.length > 0) {
+    console.log(
+      `${file.candidates.length.toLocaleString()} from GH Archive + ` +
+        `${supplementary.length.toLocaleString()} from supplementary search`,
+    );
+  }
+
+  // §8: state the budget before spending any of it, and refuse a plan that
+  // cannot finish rather than starting one that will not.
+  const estimate = estimateBudget({ usersToHydrate: candidates.length, batchSize: 100 });
+  console.log(`\n${formatBudget(estimate)}\n`);
+  assertWithinBudget(estimate);
+
+  const avatars = new Map(candidates.map((candidate) => [candidate.login, candidate.avatarUrl]));
+  const window = contributionWindow(new Date(`${context.date}T00:00:00Z`));
+
+  const users: RankedUser[] = [];
+  const skipped: string[] = [];
+  let batches = 0;
+
+  await context.api.enrichUsers(
+    candidates.map((candidate) => candidate.login),
+    window,
+    {
+      calendar: false,
+      onBatch: ({ users: decoded, skipped: missing }) => {
+        for (const user of decoded) {
+          const ranked = toRankedUser(user, { avatarUrl: avatars.get(user.login) });
+          if (ranked.contributions.total <= 0) continue;
+          if (ranked.flagged) flagged.push(ranked);
+          else users.push(ranked);
+        }
+        skipped.push(...missing);
+
+        // One line per batch, as the standing rules require: this is the
+        // smallest unit at which a run can be seen going wrong.
+        if (++batches % 25 === 0 || decoded.length === 0) {
+          console.log(
+            `  batch ${String(batches).padStart(5)} · ${users.length.toLocaleString()} ranked · ` +
+              `${skipped.length} unresolved`,
+          );
+        }
+      },
+    },
+  );
+
+  console.log(
+    `\nHydrated ${users.length.toLocaleString()} developers ` +
+      `(${flagged.length} flagged as automation, ${skipped.length} logins no longer resolve)`,
+  );
+
+  await publishHydrated(context, users);
+}
+
+/**
+ * Derives every board from one hydrated set.
+ *
+ * Country and city boards used to each run their own location-qualified search,
+ * which meant paying separately for people the worldwide pass had already
+ * fetched, and inheriting the search API's 1,000-result ceiling per place.
+ * Grouping one hydrated set on its parsed location costs nothing extra and has
+ * no ceiling.
+ */
+async function publishHydrated(context: Context, users: RankedUser[]): Promise<void> {
+  const worldwide = assignRanks(users, "worldwide").slice(0, WORLDWIDE_SIZE);
+
+  // Registered now, written at the very end.
+  //
+  // `assignRanks` mutates `rank.country` and `rank.city` on these same objects
+  // as the place boards are derived below, so serialising a profile before that
+  // happens stores a record whose country and city ranks are permanently null.
+  // The set has to be populated up front regardless, because `publishPlace`
+  // reads it to decide whether a row links to a profile page or out to GitHub.
+  const profiled = worldwide.slice(0, PROFILE_DEPTH);
+  for (const user of profiled) context.profiles.add(user.login);
+
+  const previous = previousRanks(await readHistory("worldwide", context.dataDir));
+  const entries = worldwide.map((user, index) =>
+    toLeaderboardEntry(user, index + 1, {
+      previousRank: previous.get(user.login) ?? null,
+      hasProfile: context.profiles.has(user.login),
+    }),
+  );
+
+  await writeBoard(context, path.join("leaderboard", "worldwide.json"), {
+    scope: "worldwide",
+    name: "Worldwide",
+    generatedAt: context.date,
+    entries,
+  });
+
+  await updateHistory({
+    file: "worldwide",
+    scope: "worldwide",
+    date: context.date,
+    // History is the bump chart's input and only ever plots the visible head;
+    // recording a quarter of a million tuples a day would dwarf the snapshot it
+    // describes.
+    points: entries.slice(0, 500).map((entry) => ({
+      login: entry.login,
+      rank: entry.rank,
+      total: entry.total,
+    })),
+    dataDir: context.dataDir,
+  });
+
+  const byCountry = new Map<string, RankedUser[]>();
+  const byCity = new Map<string, { name: string; users: RankedUser[] }>();
+
+  for (const user of worldwide) {
+    if (user.countryId) {
+      const bucket = byCountry.get(user.countryId) ?? [];
+      bucket.push(user);
+      byCountry.set(user.countryId, bucket);
+    }
+    if (user.cityId) {
+      const country = user.countryId ? COUNTRY_BY_SLUG.get(user.countryId) : null;
+      const parsed = country ? parseCity(user.location, country) : null;
+      const bucket = byCity.get(user.cityId) ?? { name: parsed?.name ?? user.cityId, users: [] };
+      bucket.users.push(user);
+      byCity.set(user.cityId, bucket);
+    }
+  }
+
+  for (const [slug, bucket] of [...byCountry].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const country = COUNTRY_BY_SLUG.get(slug);
+    if (!country) continue;
+    await publishPlace(context, {
+      scope: `country:${slug}`,
+      file: path.join("country", `${slug}.json`),
+      name: country.name,
+      users: bucket,
+      rankField: "country",
+      depth: USERS_PER_COUNTRY,
+      profileDepth: 0,
+      history: `country-${slug}`,
+    });
+  }
+
+  let cities = 0;
+  for (const [id, bucket] of [...byCity].sort((a, b) => a[0].localeCompare(b[0]))) {
+    // A city nobody much lives in is a near-empty page, not a finding. The same
+    // threshold the seeder uses, so the two sources stay comparable.
+    if (bucket.users.length < MIN_USERS_FOR_CITY) continue;
+    await publishPlace(context, {
+      scope: `city:${id}`,
+      file: path.join("city", `${id}.json`),
+      name: bucket.name,
+      users: bucket.users,
+      rankField: "city",
+      depth: USERS_PER_CITY,
+      profileDepth: 0,
+    });
+    cities++;
+  }
+
+  // Now that every board has stamped its rank onto these objects.
+  await writeProfiles(context, profiled);
+
+  console.log(
+    `Derived ${byCountry.size} country boards and ${cities} city boards from the hydrated set`,
+  );
+}
+
+/**
+ * The second pass: buy the day-by-day calendar for the developers who have a
+ * profile page.
+ *
+ * Split from hydration because the cost profile is completely different — 371
+ * nodes per login rather than a handful of scalars — so it gets its own job,
+ * its own budget line and its own measured cost. Everyone below this depth
+ * keeps the site's deterministic estimate, labelled as an estimate.
+ */
+async function runCalendars(context: Context): Promise<void> {
+  const board = await readJsonFile<Leaderboard>(
+    path.join(context.dataDir, "leaderboard", "worldwide.json"),
+  );
+  if (!board?.entries.length) {
+    throw new Error(
+      "data/leaderboard/worldwide.json is missing or empty. Run `pnpm crawl --tier=hydrate` first.",
+    );
+  }
+
+  const logins = board.entries.slice(0, context.limit ?? PROFILE_DEPTH).map((entry) => entry.login);
+
+  // The calendar selection is heavier than the scalar one, so its cost is
+  // assumed high here and the run reports what it actually measured. If the
+  // measurement lands above this, narrow the depth rather than running longer.
+  const estimate = estimateBudget({
+    usersToHydrate: logins.length,
+    batchSize: 25,
+    observedCostPerQuery: 5,
+  });
+  console.log(`\n${formatBudget(estimate)}\n`);
+  assertWithinBudget(estimate);
+
+  const window = contributionWindow(new Date(`${context.date}T00:00:00Z`));
+  const avatars = new Map(board.entries.map((entry) => [entry.login, entry.avatarUrl]));
+  let written = 0;
+
+  await context.api.enrichUsers(logins, window, {
+    calendar: true,
+    onBatch: async ({ users }) => {
+      for (const user of users) {
+        const ranked = toRankedUser(user, { avatarUrl: avatars.get(user.login) });
+        if (!ranked.calendar) continue;
+        await writeProfiles(context, [ranked]);
+        written++;
+      }
+      if (written % 2_500 === 0 && written > 0) {
+        console.log(`  ${written.toLocaleString()} calendars fetched`);
+      }
+    },
+  });
+
+  console.log(`\nFetched ${written.toLocaleString()} measured calendars`);
+}
+
+/**
+ * Writes a board, splitting it across numbered files once it outgrows one.
+ *
+ * A single 250,000-row JSON file is not something anybody can review in a pull
+ * request, and it is the file a bad crawl would silently replace. Shards keep
+ * the diff legible; the head shard keeps the canonical name so every existing
+ * reader still finds it.
+ */
+async function writeBoard(context: Context, file: string, board: Leaderboard): Promise<void> {
+  await writeJson(path.join(context.dataDir, file), {
+    ...board,
+    entries: board.entries.slice(0, BOARD_SHARD_SIZE),
+  } satisfies Leaderboard);
+
+  for (let start = BOARD_SHARD_SIZE, part = 2; start < board.entries.length; start += BOARD_SHARD_SIZE, part++) {
+    await writeJson(path.join(context.dataDir, file.replace(/\.json$/, `.${part}.json`)), {
+      ...board,
+      entries: board.entries.slice(start, start + BOARD_SHARD_SIZE),
+    } satisfies Leaderboard);
+  }
+}
+
 // ---- Entry point ----------------------------------------------------------
 
 async function openApi(options: Options): Promise<GitHubApi> {
@@ -878,14 +1147,22 @@ export async function run(options: Options, dataDir: string = DATA_DIR): Promise
     case "discover":
       await runDiscovery(context, options);
       return;
-    case "worldwide":
-      await runWorldwide(context, flagged);
+    case "hydrate":
+      await runHydrate(context, flagged);
       break;
+    case "calendars":
+      await runCalendars(context);
+      break;
+    case "supplement":
+      await runSupplement(context);
+      break;
+    // Both now collect names for the next hydration rather than publishing a
+    // board of their own — see collectPlaceNames.
     case "countries":
-      await runCountries(context, options.shard, flagged);
+      await collectPlaceNames(context, options.shard, "countries");
       break;
     case "cities":
-      await runCities(context, options.shard, flagged);
+      await collectPlaceNames(context, options.shard, "cities");
       break;
     case "orgs":
       await runOrganizations(context);

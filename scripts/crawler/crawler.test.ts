@@ -23,7 +23,7 @@ import {
 import { CALENDAR_DAYS } from "../../lib/calendar.ts";
 import { COUNTRIES, COUNTRY_BY_SLUG } from "../lib/countries.ts";
 import { loadFixtureClient } from "./fixtures.ts";
-import { contributionWindow } from "./github.ts";
+import { buildUserQuery, contributionWindow } from "./github.ts";
 import {
   assignRanks,
   AUTOMATION_THRESHOLD,
@@ -32,7 +32,7 @@ import {
 } from "./transform.ts";
 import { appendSnapshot, applyRetention, updateHistory } from "./history.ts";
 import { parseOptions, run, selectShard } from "./index.ts";
-import { emptyState, readState, writeState } from "./state.ts";
+import { emptyState, writeState } from "./state.ts";
 
 const GERMANY = COUNTRY_BY_SLUG.get("germany")!;
 const WINDOW = contributionWindow(new Date("2026-07-25T00:00:00Z"));
@@ -205,6 +205,32 @@ async function aimAtGermany(dir: string, date: string): Promise<void> {
   await writeState(state, dir);
 }
 
+/**
+ * The candidate list hydration consumes, as discovery would have written it.
+ *
+ * Seeded rather than produced by running discovery, because discovery downloads
+ * real GH Archive hours and this test has to work offline and deterministically.
+ * The logins are the ones the GraphQL fixture has recordings for.
+ */
+async function seedCandidates(dir: string, date: string, logins: string[]): Promise<void> {
+  const { writeJson } = await import("../lib/io.ts");
+  await writeJson(path.join(dir, "discovery", "candidates.json"), {
+    generatedAt: date,
+    window: { hours: 4, from: "2026-08-02-12", to: "2026-08-02-15" },
+    minEvents: 5,
+    actorsSeen: logins.length,
+    hoursScanned: 4,
+    hoursUnavailable: [],
+    candidates: logins.map((login, index) => ({
+      login,
+      avatarUrl: `https://avatars.githubusercontent.com/u/${index + 1}?v=4`,
+      events: 100 - index,
+      repos: 10,
+      lastSeen: "2026-08-02-15",
+    })),
+  });
+}
+
 test("two fresh runs produce byte-identical, schema-valid output", async (t) => {
   const date = new Date().toISOString().slice(0, 10);
   const dirs = await Promise.all([
@@ -213,10 +239,15 @@ test("two fresh runs produce byte-identical, schema-valid output", async (t) => 
   ]);
   t.after(() => Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true }))));
 
-  const options = parseOptions(["--fixtures", "--tier=countries", "--limit=1"]);
+  // `hydrate` is the tier that publishes: every board — worldwide, country,
+  // city — is derived from one hydrated set, so this run exercises the whole
+  // fan-out rather than a single place.
+  const options = parseOptions(["--fixtures", "--tier=hydrate"]);
+  const logins = ["octoflow", "mira-dev", "zeta-builds", "release-bot-de"];
   const snapshots: Record<string, string>[] = [];
   for (const dir of dirs) {
     await aimAtGermany(dir, date);
+    await seedCandidates(dir, date, logins);
     await run(options, dir);
     snapshots.push(await snapshotOf(dir));
   }
@@ -247,13 +278,43 @@ test("two fresh runs produce byte-identical, schema-valid output", async (t) => 
   const profile = rankedUserSchema.parse(JSON.parse(first["user/oc/octoflow.json"]));
   assert.equal(profile.rank.country, 1);
 
-  // Re-running the same tier finds nothing due and leaves the snapshot alone.
-  await run(options, dirs[0]);
-  assert.deepEqual(await snapshotOf(dirs[0]), first);
+  // The scalars-only pass measured the totals but bought no calendars, so the
+  // profile must say so rather than shipping 371 zeros as a measurement.
+  assert.equal(profile.calendar, null);
+  assert.equal(profile.calendarSource, "estimated");
+  assert.ok(profile.contributions.total > 0);
 
-  const state = await readState(dirs[0]);
-  assert.equal(state.places.germany?.done, true);
-  assert.equal(state.places.germany?.lastCrawledAt, date);
+  // The worldwide board is derived from the same hydrated set, not searched
+  // for separately — that is the change that lifted it off its 500-row cap.
+  const worldwide = leaderboardSchema.parse(JSON.parse(first["leaderboard/worldwide.json"]));
+  assert.deepEqual(
+    worldwide.entries.map((entry) => entry.login),
+    ["octoflow", "mira-dev", "zeta-builds"],
+  );
+
+  // Hydration has no per-place staleness gate — it refreshes the whole corpus
+  // every run, which is the point of it. So a second run is not expected to be
+  // a no-op; it is expected to record movement and change nothing else. Anything
+  // beyond `previousRank` differing here would be the incidental churn that
+  // makes a committed-JSON dataset unreviewable.
+  await run(options, dirs[0]);
+  const second = await snapshotOf(dirs[0]);
+
+  const strip = (files: Record<string, string>) =>
+    Object.fromEntries(
+      Object.entries(files).map(([name, body]) => [
+        name,
+        body.replace(/"previousRank":(null|\d+)/g, '"previousRank":*'),
+      ]),
+    );
+  assert.deepEqual(strip(second), strip(first));
+
+  const movedBoard = leaderboardSchema.parse(JSON.parse(second["leaderboard/worldwide.json"]));
+  assert.deepEqual(
+    movedBoard.entries.map((entry) => entry.previousRank),
+    [1, 2, 3],
+    "the second run sees the first run's ranks as history, and nobody moved",
+  );
 });
 
 test("history compaction on disk is idempotent", async (t) => {
@@ -291,6 +352,56 @@ test("bad flags are rejected loudly", () => {
   assert.throws(() => parseOptions(["--shard=0/4"]), /--shard/);
   assert.throws(() => parseOptions(["--limit=nope"]), /--limit/);
   assert.throws(() => parseOptions(["--wat"]), /Unknown argument/);
+});
+
+test("the scalars-only pass drops the days but keeps the twelve-month total", () => {
+  const withDays = buildUserQuery(2);
+  const withoutDays = buildUserQuery(2);
+  const scalars = buildUserQuery(2, { calendar: false });
+
+  assert.equal(withDays, withoutDays, "the builder is deterministic");
+  assert.match(withDays, /contributionDays/, "the default pass fetches the calendar");
+
+  // The 371 nodes per alias are what makes a corpus-wide pass unaffordable.
+  assert.doesNotMatch(scalars, /contributionDays/);
+  assert.doesNotMatch(scalars, /weeks/);
+
+  // …but totalContributions is one scalar and is the only authoritative
+  // twelve-month figure. Dropping it would mean ranking on a number GitHub does
+  // not agree with, so it must survive.
+  assert.match(scalars, /contributionCalendar \{\s*totalContributions\s*\}/);
+  assert.match(scalars, /restrictedContributionsCount/);
+  assert.match(scalars, /rateLimit \{ cost limit remaining resetAt nodeCount \}/);
+});
+
+test("a user hydrated without days gets no calendar rather than an empty one", () => {
+  const scalarOnly = {
+    login: "scalars",
+    name: "Scalars Only",
+    avatarUrl: "https://avatars.githubusercontent.com/u/1?v=4",
+    location: "Berlin, Germany",
+    company: null,
+    bio: null,
+    followers: { totalCount: 10 },
+    repositories: { totalCount: 3 },
+    contributionsCollection: {
+      totalCommitContributions: 100,
+      totalPullRequestContributions: 10,
+      totalIssueContributions: 5,
+      totalPullRequestReviewContributions: 2,
+      restrictedContributionsCount: 20,
+      // No `weeks`: this is what the scalars-only query returns.
+      contributionCalendar: { totalContributions: 137 },
+    },
+  };
+
+  const user = toRankedUser(scalarOnly);
+
+  assert.equal(user.contributions.total, 137, "the measured total still lands");
+  assert.equal(user.calendar, null, "371 zeros would be a fabricated year of inactivity");
+  assert.equal(user.calendarSource, "estimated");
+  assert.equal(user.streak, null, "a streak from an absent calendar would be invented");
+  assert.equal(user.countryId, "germany", "location still parses");
 });
 
 /** Every file the run wrote, keyed by its path relative to the data directory. */

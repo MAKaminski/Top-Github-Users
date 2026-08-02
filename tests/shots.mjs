@@ -19,6 +19,10 @@ const OUT = process.argv[3] ?? "/tmp/shots";
 const ROUTES = [
   ["home", "/"],
   ["leaderboard", "/leaderboard"],
+  ["leaderboard-followers", "/leaderboard?sort=followers"],
+  ["leaderboard-streak", "/leaderboard?sort=streak"],
+  ["search", "/search"],
+  ["search-results", "/search?q=felix"],
   ["podium", "/podium"],
   ["countries", "/countries"],
   ["country", "/countries/japan"],
