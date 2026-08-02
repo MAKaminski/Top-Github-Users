@@ -64,7 +64,11 @@ export function datasetSchema(manifest: Manifest): Json {
       `${manifest.counts.countries} countries and ${manifest.counts.cities} cities. ` +
       `${manifest.sourceNote}`,
     url: SITE_URL,
-    license: "https://opensource.org/licenses/MIT",
+    // No `license` field until the repository actually carries a LICENSE. An
+    // earlier draft asserted MIT here, which was a licence this project has
+    // never declared — and a fabricated licence in machine-readable metadata is
+    // exactly the kind of claim the rest of the site exists to avoid. Add the
+    // field back the moment a real one is chosen.
     isAccessibleForFree: true,
     creator: { "@type": "Organization", name: SITE_NAME, url: SITE_URL },
     dateModified: manifest.generatedAt,
