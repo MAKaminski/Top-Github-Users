@@ -1132,8 +1132,41 @@ async function writeBoard(context: Context, file: string, board: Leaderboard): P
 
 // ---- Entry point ----------------------------------------------------------
 
+/** Tiers that never touch the GitHub API, and so must never demand a token. */
+const TOKENLESS_TIERS = new Set<Tier>(["discover"]);
+
+/** Exported so the test asserts the same predicate `openApi` branches on,
+ *  rather than a copy of it that can drift. */
+export function needsToken(tier: Tier): boolean {
+  return !TOKENLESS_TIERS.has(tier);
+}
+
+/**
+ * Refuses every call rather than holding a half-configured client.
+ *
+ * Discovery reads GH Archive — public object storage — so requiring a token for
+ * it would make the *free* half of the pipeline depend on the credential the
+ * paid half needs. The workflow already says as much: the discover job is
+ * deliberately not gated on the token check, because knowing the candidate set
+ * is most useful precisely when the secret is missing.
+ *
+ * A stub that throws is better than `null` here: if a tier is ever added to
+ * TOKENLESS_TIERS by mistake and does call the API, this says so by name
+ * instead of failing as an unexplained TypeError.
+ */
+function tokenlessApi(tier: Tier): GitHubApi {
+  const refuse = (): never => {
+    throw new Error(
+      `Tier "${tier}" is registered as tokenless but tried to call the GitHub API. ` +
+        "Either it does need a token — remove it from TOKENLESS_TIERS — or the call is a bug.",
+    );
+  };
+  return { searchUsers: refuse, searchRepositories: refuse, enrichUsers: refuse };
+}
+
 async function openApi(options: Options): Promise<GitHubApi> {
   if (options.fixtures) return loadFixtureClient();
+  if (TOKENLESS_TIERS.has(options.tier)) return tokenlessApi(options.tier);
   return new GitHubClient({
     token: requireToken(),
     languages: true,

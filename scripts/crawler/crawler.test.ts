@@ -23,7 +23,7 @@ import {
 import { CALENDAR_DAYS } from "../../lib/calendar.ts";
 import { COUNTRIES, COUNTRY_BY_SLUG } from "../lib/countries.ts";
 import { loadFixtureClient } from "./fixtures.ts";
-import { buildUserQuery, contributionWindow } from "./github.ts";
+import { buildUserQuery, contributionWindow, requireToken } from "./github.ts";
 import {
   assignRanks,
   AUTOMATION_THRESHOLD,
@@ -31,7 +31,7 @@ import {
   toRankedUser,
 } from "./transform.ts";
 import { appendSnapshot, applyRetention, updateHistory } from "./history.ts";
-import { parseOptions, run, selectShard } from "./index.ts";
+import { needsToken, parseOptions, run, selectShard } from "./index.ts";
 import { emptyState, writeState } from "./state.ts";
 
 const GERMANY = COUNTRY_BY_SLUG.get("germany")!;
@@ -352,6 +352,23 @@ test("bad flags are rejected loudly", () => {
   assert.throws(() => parseOptions(["--shard=0/4"]), /--shard/);
   assert.throws(() => parseOptions(["--limit=nope"]), /--limit/);
   assert.throws(() => parseOptions(["--wat"]), /Unknown argument/);
+});
+
+test("discovery needs no token, because GH Archive is not the GitHub API", () => {
+  // The workflow deliberately does not gate the discover job on the token
+  // check — knowing the candidate set is most useful when the secret is
+  // missing. This is the code side of that promise, and it was broken: `run`
+  // built a GitHubClient for every tier, so a real run died on the missing
+  // secret before downloading a single archive hour.
+  assert.equal(needsToken("discover"), false);
+
+  // Everything that does reach the API must keep demanding one. An empty
+  // environment has to throw rather than fall through to an unauthenticated
+  // crawl, which would commit an empty snapshot over good data.
+  for (const tier of ["hydrate", "calendars", "supplement", "countries", "cities"] as const) {
+    assert.equal(needsToken(tier), true, tier);
+  }
+  assert.throws(() => requireToken({} as NodeJS.ProcessEnv), /No GitHub token/);
 });
 
 test("the scalars-only pass drops the days but keeps the twelve-month total", () => {
