@@ -1,6 +1,7 @@
 /**
  * Crawler entry point.
  *
+ *   pnpm crawl --tier=verify                # one point: is the token accepted?
  *   pnpm crawl --tier=discover              # free: GH Archive, no API budget
  *   pnpm crawl --tier=hydrate               # the corpus, batched GraphQL
  *   pnpm crawl --tier=calendars             # the expensive field, profile depth
@@ -132,6 +133,7 @@ const DAILY_COUNTRIES = 40;
 const FRESHNESS: Record<Tier, number> = {
   // Discovery costs no API budget, so it can run as often as the archive
   // publishes. Its own hour cache is what stops it redoing work.
+  verify: 0,
   discover: 0,
   hydrate: 1,
   calendars: 1,
@@ -173,6 +175,7 @@ const DEFAULT_MIN_EVENTS = 5;
 const ARCHIVE_HOURS_RETAINED = DEFAULT_ARCHIVE_HOURS * 2;
 
 const TIERS = [
+  "verify",
   "discover",
   "hydrate",
   "calendars",
@@ -1133,7 +1136,7 @@ async function writeBoard(context: Context, file: string, board: Leaderboard): P
 // ---- Entry point ----------------------------------------------------------
 
 /** Tiers that never touch the GitHub API, and so must never demand a token. */
-const TOKENLESS_TIERS = new Set<Tier>(["discover"]);
+const TOKENLESS_TIERS = new Set<Tier>(["discover", "verify"]);
 
 /** Exported so the test asserts the same predicate `openApi` branches on,
  *  rather than a copy of it that can drift. */
@@ -1195,6 +1198,13 @@ export async function run(options: Options, dataDir: string = DATA_DIR): Promise
   const flagged: RankedUser[] = [];
 
   switch (options.tier) {
+    // A one-point preflight, so a rejected credential fails at the top of the
+    // job rather than after 3.5 GB of archive download and a printed budget.
+    case "verify": {
+      const client = new GitHubClient({ token: requireToken(), log: (m) => console.log(`  … ${m}`) });
+      await client.verifyToken();
+      return;
+    }
     case "discover":
       await runDiscovery(context, options);
       return;

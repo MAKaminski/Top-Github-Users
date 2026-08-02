@@ -23,7 +23,7 @@ on:
         description: Tier to run
         type: choice
         default: hydrate
-        options: [discover, hydrate, calendars, supplement, countries, cities, orgs, repos]
+        options: [verify, discover, hydrate, calendars, supplement, countries, cities, orgs, repos]
       shard:
         description: "Shard, as N/M — countries and cities only"
         type: string
@@ -102,6 +102,13 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # One GraphQL point, spent first. Discovery reads 3.5 GB of GH Archive
+      # before hydration touches the API, so without this a rejected token
+      # surfaces four minutes and a full discovery pass into the job.
+      - name: Verify the token is accepted
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=verify
       # candidates.json is gitignored — it is regenerated in seconds and is an
       # intermediate, not a snapshot — so this job produces its own.
       - name: Discover candidates from GH Archive
@@ -131,6 +138,13 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # One GraphQL point, spent first. Discovery reads 3.5 GB of GH Archive
+      # before hydration touches the API, so without this a rejected token
+      # surfaces four minutes and a full discovery pass into the job.
+      - name: Verify the token is accepted
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=verify
       - name: Fetch calendars
         env:
           GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}

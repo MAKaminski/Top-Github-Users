@@ -197,6 +197,31 @@ export function requireToken(env: NodeJS.ProcessEnv = process.env): string {
   return token;
 }
 
+/**
+ * The message for a 401.
+ *
+ * Worth spelling out because the failure is confusing: the workflow's token
+ * gate passes (the secret exists and is non-empty), the budget block prints,
+ * and only then does GitHub reject the credential. "Bad credentials" alone
+ * sends people to check whether the secret is set, which it is.
+ */
+export function badCredentials(): string {
+  return [
+    "GitHub rejected the token (HTTP 401 Bad credentials).",
+    "",
+    "The secret exists — an empty one is caught earlier — so the value itself is not accepted.",
+    "In order of likelihood:",
+    "  1. The token expired, or was revoked. Classic tokens expire by default.",
+    "  2. Only part of it was pasted. A classic token is `ghp_` + 36 characters;",
+    "     a fine-grained one is `github_pat_` + rather more.",
+    "  3. It is a fine-grained token still awaiting approval, or scoped to an",
+    "     organisation that has not granted it.",
+    "",
+    "Generate a replacement at https://github.com/settings/tokens/new — no scopes are needed,",
+    "everything this crawler reads is public — and update the GH_CRAWL_TOKEN repository secret.",
+  ].join("\n");
+}
+
 /** Escapes a free-text place name for use inside a quoted search qualifier. */
 export function locationQuery(place: string): string {
   return `location:"${place.replace(/"/g, "")}" type:user`;
@@ -483,6 +508,27 @@ export class GitHubClient implements GitHubApi {
     this.batchSize = GRAPHQL_BATCH_START;
   }
 
+  /**
+   * One point, spent to answer "will this token work at all?".
+   *
+   * Worth its own call because of where the alternative fails: hydration reads
+   * 3.5 GB of GH Archive and prints a budget before it touches the API, so a
+   * bad credential surfaces four minutes and a full discovery pass into the
+   * run. This turns that into a one-second failure at the top of the job.
+   */
+  async verifyToken(): Promise<string> {
+    const body = (await this.request(GRAPHQL_ENDPOINT, {
+      method: "POST",
+      body: JSON.stringify({ query: "query Verify { viewer { login } rateLimit { remaining } }" }),
+    })) as { data?: { viewer?: { login?: string }; rateLimit?: { remaining?: number } } };
+
+    const login = body.data?.viewer?.login;
+    if (!login) throw new Error(badCredentials());
+
+    this.log(`token accepted for @${login}; ${body.data?.rateLimit?.remaining ?? "?"} points left`);
+    return login;
+  }
+
   async searchUsers(query: string, options: SearchOptions = {}): Promise<SearchUser[]> {
     return this.searchPaged(`${API_ROOT}/search/users`, query, "followers", options, (body) =>
       decodeSearchUsers(body),
@@ -686,6 +732,11 @@ export class GitHubClient implements GitHubApi {
 
       const text = await response.text();
       lastError = `HTTP ${response.status}: ${text.slice(0, 300)}`;
+
+      // A 401 is never worth retrying and never worth a raw dump: the token is
+      // present (the run got this far) but GitHub will not accept it, and the
+      // fix is always the same handful of things.
+      if (response.status === 401) throw new Error(badCredentials());
 
       const advised = retryAfterMs(response.headers);
       const shouldRetry =

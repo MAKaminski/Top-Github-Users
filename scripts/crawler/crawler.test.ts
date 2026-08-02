@@ -365,6 +365,8 @@ test("discovery needs no token, because GH Archive is not the GitHub API", () =>
   // Everything that does reach the API must keep demanding one. An empty
   // environment has to throw rather than fall through to an unauthenticated
   // crawl, which would commit an empty snapshot over good data.
+  // `verify` is the exception that proves the rule: it *is* an API call, but it
+  // constructs its own client so it can report a rejected credential itself.
   for (const tier of ["hydrate", "calendars", "supplement", "countries", "cities"] as const) {
     assert.equal(needsToken(tier), true, tier);
   }
