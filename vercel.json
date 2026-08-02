@@ -1,5 +1,21 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+
+  "//": [
+    "framework is pinned deliberately. This project was imported with framework",
+    "detection returning null, so Vercel ran a static build and failed with 'No",
+    "Output Directory named public found' — a Next.js app emits .next, never",
+    "public/. Setting it here overrides the project setting and keeps the fix in",
+    "version control, where a re-import cannot lose it.",
+    "",
+    "The commands are explicit for the same reason: prebuild runs tsx to build",
+    "the search index, so the install must include devDependencies."
+  ],
+
+  "framework": "nextjs",
+  "installCommand": "pnpm install --frozen-lockfile",
+  "buildCommand": "pnpm build",
+
   "headers": [
     {
       "source": "/api/(.*)",
