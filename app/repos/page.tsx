@@ -7,6 +7,8 @@ import { abbreviate, rankLabel } from "@/lib/format";
 export const metadata: Metadata = {
   title: "Repositories",
   description: "The most starred repositories tracked by Commitgraph.",
+  alternates: { canonical: "/repos" },
+  openGraph: { title: "Top repositories · Commitgraph", url: "/repos" },
 };
 
 export default async function ReposPage() {

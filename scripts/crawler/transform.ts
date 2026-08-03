@@ -137,7 +137,15 @@ export function matchCountry(location: string | null): CountryDef | null {
 
 export function toRankedUser(user: GraphUser, options: TransformOptions = {}): RankedUser {
   const contributions = contributionsFrom(user);
-  const calendar = calendarFrom(user.contributionsCollection.contributionCalendar.weeks ?? []);
+
+  // A scalars-only hydration pass does not ask for the days, and an absent
+  // `weeks` is not an empty calendar. Filling 371 zeros here would publish a
+  // measured-looking record showing a year of no activity for someone with
+  // tens of thousands of contributions — so the calendar stays null and the
+  // site's own deterministic estimate takes over, labelled as such.
+  const weeks = user.contributionsCollection.contributionCalendar.weeks;
+  const calendar = weeks ? calendarFrom(weeks) : null;
+
   const location = clean(user.location);
   const country = options.country ?? matchCountry(location);
   const city = country ? parseCity(location, country) : null;
@@ -154,10 +162,10 @@ export function toRankedUser(user: GraphUser, options: TransformOptions = {}): R
     publicRepos: nonNegative(user.repositories?.totalCount),
     contributions,
     calendar,
-    calendarSource: "measured",
+    calendarSource: calendar ? "measured" : "estimated",
     languages: languages.languages,
     languageSource: languages.source,
-    streak: streaksFrom(calendar),
+    streak: calendar ? streaksFrom(calendar) : null,
     rank: { worldwide: null, country: null, city: null },
     countryId: country?.slug ?? null,
     cityId: city?.id ?? null,

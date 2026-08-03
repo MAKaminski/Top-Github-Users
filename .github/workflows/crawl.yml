@@ -14,7 +14,18 @@ on:
     # Off the hour: everything else in the world is scheduled on it, and GitHub
     # queues scheduled runs accordingly.
     - cron: "5 */6 * * *" # 6-hourly — GH Archive discovery (no API budget)
-    - cron: "17 3 * * *" # daily   — worldwide + the largest countries
+    - cron: "17 3 * * *" # daily   — hydrate the discovered corpus, then calendars
+    # Resume slots, same UTC day as the daily pass above.
+    #
+    # 250,000 logins at ten aliases a query is 25,000 points, and the free
+    # ceiling is 5,000 an hour — so a full pass is five hours of *budget* no
+    # matter how fast the network is, and a six-hour job ceiling leaves no
+    # margin for a slow start or an hour lost to backoff. The hydration journal
+    # is keyed by snapshot date and skips what it already has, so these two
+    # simply carry on. Both are no-ops once the corpus is complete: every login
+    # is in the journal, and the run costs a checkout.
+    - cron: "17 9 * * *" # daily   — resume hydration if the 03:17 pass ran out of clock
+    - cron: "17 15 * * *" # daily   — second resume, same snapshot date
     - cron: "43 4 * * 0" # weekly  — remaining countries, organisations, repositories
     - cron: "11 5 1 * *" # monthly — cities
   workflow_dispatch:
@@ -22,8 +33,8 @@ on:
       tier:
         description: Tier to run
         type: choice
-        default: worldwide
-        options: [discover, worldwide, countries, cities, orgs, repos]
+        default: hydrate
+        options: [verify, discover, hydrate, calendars, supplement, countries, cities, orgs, repos]
       shard:
         description: "Shard, as N/M — countries and cities only"
         type: string
@@ -35,6 +46,17 @@ on:
 
 permissions:
   contents: write
+
+# One crawl at a time, and never cancel one that is running.
+#
+# Both halves matter. Two hydrate runs overlapping would hold two views of the
+# same journal and spend the hour's budget twice on the same logins, then race
+# to commit; and `cancel-in-progress: true` would let the 09:17 resume kill the
+# 03:17 pass it exists to continue. Queueing is the correct behaviour here —
+# a resume that starts late still resumes.
+concurrency:
+  group: crawl
+  cancel-in-progress: false
 
 jobs:
   # Fails the workflow before anything writes. The crawler aborts on a missing
@@ -55,6 +77,31 @@ jobs:
                  "cannot reach the API and would commit an empty snapshot over good data."
             exit 1
           fi
+
+  # A standalone diagnostic, cheap enough to run whenever the API is behaving
+  # strangely: one point for the viewer check, then one per probed alias count
+  # using the exact selection hydration sends. It reports the largest count
+  # GitHub will serve and the schedule that follows from it — the number the
+  # whole hydration plan rests on, and one that moves. No discovery in front of
+  # it, so it answers in under a minute instead of after a 3.5 GB download.
+  verify:
+    needs: token
+    if: github.event_name == 'workflow_dispatch' && inputs.tier == 'verify'
+    name: verify (token and the alias ceiling)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=verify
 
   # Discovery reads GH Archive, which is public object storage — no token, and
   # therefore deliberately NOT gated on the `token` job. It can run even when the
@@ -80,10 +127,108 @@ jobs:
       - name: Commit
         run: .github/scripts/commit-data.sh discover
 
-  worldwide:
+  # The main pass. Reads the candidate list discovery already wrote and turns it
+  # into every board, at ten aliases a GraphQL query — the measured ceiling for
+  # a query carrying `contributionsCollection`; see the verify job. Scalars
+  # only: the day-by-day calendar is 371 nodes per login and belongs to the job
+  # below.
+  hydrate:
     needs: token
-    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'worldwide')
-    name: worldwide
+    if: >-
+      github.event.schedule == '17 3 * * *' ||
+      github.event.schedule == '17 9 * * *' ||
+      github.event.schedule == '17 15 * * *' ||
+      (github.event_name == 'workflow_dispatch' && inputs.tier == 'hydrate')
+    name: hydrate (scalars, whole corpus)
+    runs-on: ubuntu-latest
+    # Just inside the 6-hour hosted-runner ceiling. A full corpus is five hours
+    # of rate-limit budget on its own, so this job is expected to run long and
+    # occasionally to be cut off — which is what the resume crons and the
+    # journal are for. The printed budget still refuses a plan that cannot
+    # finish at all.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # One GraphQL point, spent first. Discovery reads 3.5 GB of GH Archive
+      # before hydration touches the API, so without this a rejected token
+      # surfaces four minutes and a full discovery pass into the job.
+      - name: Verify the token is accepted
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=verify
+      # candidates.json is gitignored — it is regenerated in seconds and is an
+      # intermediate, not a snapshot — so this job produces its own.
+      - name: Discover candidates from GH Archive
+        run: pnpm crawl --tier=discover
+      - name: Hydrate
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=hydrate ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      # `if: always()` because a job cancelled by `timeout-minutes` skips every
+      # remaining step, and that is how run 30767109823 threw away five hours of
+      # hydration: 26,783 developers collected, nothing committed. The crawler
+      # now stops itself before the timeout so this runs on the normal path, but
+      # a run killed for any other reason should still keep what it wrote.
+      # commit-data.sh no-ops when there is nothing staged, so this is safe.
+      - name: Commit
+        if: always()
+        run: .github/scripts/commit-data.sh hydrate
+
+  # The expensive selection, bought only for the depth that has a profile page.
+  # Runs after hydration because it reads the board hydration just wrote.
+  calendars:
+    needs: [token, hydrate]
+    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'calendars')
+    name: calendars (measured, profile depth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # One GraphQL point, spent first. Discovery reads 3.5 GB of GH Archive
+      # before hydration touches the API, so without this a rejected token
+      # surfaces four minutes and a full discovery pass into the job.
+      - name: Verify the token is accepted
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=verify
+      - name: Fetch calendars
+        env:
+          GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
+        run: pnpm crawl --tier=calendars ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      # `if: always()` because a job cancelled by `timeout-minutes` skips every
+      # remaining step, and that is how run 30767109823 threw away five hours of
+      # hydration: 26,783 developers collected, nothing committed. The crawler
+      # now stops itself before the timeout so this runs on the normal path, but
+      # a run killed for any other reason should still keep what it wrote.
+      # commit-data.sh no-ops when there is nothing staged, so this is safe.
+      - name: Commit
+        if: always()
+        run: .github/scripts/commit-data.sh calendars
+
+  # The supplementary search pass. GH Archive only records *public* activity, so
+  # a developer working almost entirely in private repositories never appears in
+  # it; this is the pass that finds them. Weekly, not daily — it is capped at
+  # 1,000 results per query and costs search budget that hydration does not.
+  supplement:
+    needs: token
+    if: github.event.schedule == '43 4 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'supplement')
+    name: supplement (search for mostly-private accounts)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -99,14 +244,18 @@ jobs:
       - name: Crawl
         env:
           GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
-        run: pnpm crawl --tier=worldwide ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+        run: pnpm crawl --tier=supplement
       - name: Commit
-        run: .github/scripts/commit-data.sh worldwide
+        run: .github/scripts/commit-data.sh supplement
 
+  # Moved off the daily cron when hydration started deriving country boards by
+  # grouping the hydrated set. Running both on the same day would have the
+  # shallow search-derived board (150 rows, capped by the search API) overwrite
+  # the derived one (up to 25,000) a few minutes later.
   countries_daily:
     needs: token
-    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'countries' && inputs.shard == '')
-    name: countries (daily set)
+    if: github.event.schedule == '43 4 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'countries' && inputs.shard == '')
+    name: countries (supplementary search, head of list)
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:

@@ -90,6 +90,18 @@ export interface LeaderboardEntry {
   /** True when a profile page exists for this login; otherwise the row links
    *  out to github.com rather than to a page we did not build. */
   hasProfile: boolean;
+
+  /**
+   * Attached when a board is served, not stored in the committed board files.
+   *
+   * Streak needs the day-by-day calendar, which is the expensive field to
+   * fetch, so it lives in the search index where it is computed once rather
+   * than being duplicated into every country and city file.
+   */
+  streak?: { current: number; longest: number } | null;
+  /** False when `streak` came from an estimated calendar rather than a fetched
+   *  one. The UI must mark those rows; see /methodology. */
+  calendarMeasured?: boolean | null;
 }
 
 export interface Place {

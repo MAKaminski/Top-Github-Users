@@ -7,7 +7,11 @@ import { abbreviate, exact, rankLabel } from "@/lib/format";
 
 export const metadata: Metadata = {
   title: "Cities",
-  description: "GitHub contribution leaderboards for every tracked city.",
+  description:
+    "GitHub contribution leaderboards for every tracked city, kept only where enough developers " +
+    "agree on the same place name.",
+  alternates: { canonical: "/cities" },
+  openGraph: { title: "Top GitHub developers by city · Commitgraph", url: "/cities" },
 };
 
 export default async function CitiesPage() {

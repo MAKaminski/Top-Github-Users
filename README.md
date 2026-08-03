@@ -38,6 +38,11 @@ pnpm dev       # http://localhost:3000
 to this repository, so `pnpm install && pnpm dev` is usually enough.
 
 Requires Node 22+ and pnpm 10. No GitHub token is needed to run the site — see below.
+Copy [`.env.example`](.env.example) to `.env.local` if you want analytics or a custom
+canonical domain locally; every variable in it is optional.
+
+Deeper detail on how the pieces fit together lives in [`ARCH.md`](ARCH.md). The Product
+Hunt submission kit is in [`docs/LAUNCH.md`](docs/LAUNCH.md).
 
 ## Data pipeline
 
@@ -50,15 +55,59 @@ dataset into this project's schema so a fresh clone renders real rankings immedi
 It writes `source: "bootstrap"` into the manifest, and the site surfaces that on
 `/methodology` with attribution. It fetches 75 users per country, keeps a city only
 where at least 8 tracked developers agree on the name, and generates profile pages for
-the worldwide top 500 plus each place's leaders.
+the worldwide top 500 plus each place's leaders. It is a starting point, not the
+intended source — the crawler below replaces it.
 
-**Scheduled crawler** — `scripts/crawler/`, run by `pnpm crawl`. This is the project's
-intended long-term source: it talks to the GitHub API directly, fetches real 371-day
-contribution calendars and language breakdowns rather than estimating them, and
-replaces the bootstrap snapshot wholesale on its first successful run. *It is not in
-this tree yet* — the `crawl` and `crawl:fixtures` scripts in `package.json` reference
-`scripts/crawler/index.ts`, which has not been committed. Today the seeder is the only
-working source.
+**Scheduled crawler** — `scripts/crawler/`, run by `pnpm crawl`. The project's intended
+long-term source. It replaces the bootstrap snapshot wholesale on its first successful
+run, and it works in four stages:
+
+| Tier | Cost | What it does |
+| --- | --- | --- |
+| `discover` | **free** | Streams a rolling 7-day window of [GH Archive](https://www.gharchive.org/) and ranks every actor by public authorship events. No token, no API budget. Measured here: 4 hours = 63,444 distinct actors in 8.8 seconds. |
+| `verify` | 7 points | Preflight. Checks the token, then measures how many aliases GitHub will actually serve — see below. Runs first inside every hydrating job so a bad credential fails in a second rather than after a 3.5 GB download. |
+| `hydrate` | ~25,000 GraphQL points | Fetches the filtered head of that list at **10 aliases a query** (the measured ceiling), six requests in flight, then **derives** the worldwide, country and city boards by grouping one hydrated set. |
+| `calendars` | the expensive one | Buys the 371-day contribution calendar — 371 nodes per login — only for the depth that has a profile page. Everyone below keeps a labelled estimate. |
+| `supplement` | search budget | Follower- and location-ordered search, for developers whose work is almost entirely private and who therefore emit no public events. Contributes *names* for the next hydration; publishes no board. |
+
+The corpus is capped at **250,000 developers**, a storage decision rather than an API
+one: snapshots are committed to git so each can be diffed against the day before.
+
+### The alias ceiling, and why it is measured
+
+CLAUDE.md §1 says a batched `user()` query costs one point per hundred logins. The
+*points* half is true — a ten-alias query bills 1, same as a one-alias query — but 100
+aliases is unreachable for this selection, and the rate limit is not the reason.
+
+`contributionsCollection` makes GitHub aggregate a year of events per alias inside a
+single query's execution budget, and that budget is what runs out. The `verify` tier
+measures where. On 2026-08-02, against a personal token:
+
+```
+  1 alias   cost 1   0.5s   ok
+  2         cost 1   0.9s   ok
+  3         cost 1   1.3s   ok
+  5         cost 1   2.0s   ok
+ 10         cost 1   3.4s   ok
+ 25         —        7.0s   "Resource limits for this query exceeded."
+```
+
+So 250,000 developers is 25,000 queries and **five hours of rate-limit budget**, not the
+half hour a hundred-per-query assumption predicts. That is longer than a GitHub Actions
+job may run, which is why hydration is resumable: two extra cron slots the same UTC day
+continue an interrupted pass, and a workflow-level `concurrency` group stops two runs
+spending the same hour's budget twice.
+
+Resume rebuilds from the **committed board**, not from the run journal — `data/discovery/`
+is gitignored, so the journal only ever survives a crash inside one job. Full profiles are
+restored where one exists; below profile depth a board row carries everything any board,
+the search index or the API serves.
+
+Re-measure with `pnpm crawl --tier=verify` whenever throughput looks wrong. It takes under
+a minute, costs about seven points, and prints the schedule that follows from the result.
+
+The crawler needs a `GH_CRAWL_TOKEN` repository secret — a classic PAT with **no
+scopes** is enough, since everything it reads is public.
 
 **Where snapshots live** — everything under `data/`, committed as JSON so any ranking
 can be diffed against the day before it:
@@ -69,7 +118,7 @@ can be diffed against the day before it:
 | `data/leaderboard/worldwide.json` | The global ranking |
 | `data/country/{id}.json` | Per-country leaderboards (88 at present) |
 | `data/city/{id}.json` | Per-city leaderboards (119 at present) |
-| `data/user/{login}.json` | Full per-developer records, including the calendar (451 at present) |
+| `data/user/{shard}/{login}.json` | Full per-developer records, including the calendar (2,529 at present) |
 | `data/history/worldwide.json` | Compacted rank history — what the bump chart reads |
 | `data/org/top.json`, `data/repo/top.json` | Organization and repository boards |
 | `data/flagged.json` | Accounts excluded as automation, published rather than hidden |
@@ -152,7 +201,54 @@ agent in plain text, caveats included.
 
 Search has to see every ranked developer, but they live across 88 country files and 119 city
 files. `scripts/build-index.ts` flattens them into `data/index/search.json` — one read instead
-of 207. It runs automatically as `prebuild`.
+of 207 — plus `data/index/order.json`, three arrays of row indices so serving any sorted page
+is a slice rather than a sort. Both run automatically as `prebuild`.
+
+Rows are stored as **array tuples**, not objects, and the avatar is a numeric account id
+rather than a URL. That took a row from 377 bytes to 105 — the difference between 250,000
+developers being 94 MB and being ~26 MB, which is the difference between the index fitting in
+git and in a serverless function and not.
+
+## Discoverability
+
+Everything here derives from `lib/site.ts`, which owns the canonical origin. Point a real
+domain at the deployment by setting `NEXT_PUBLIC_SITE_URL`; nothing else needs editing.
+
+- **Canonical URLs on every route.** `/leaderboard` self-canonicalises including `?sort`
+  and `?offset`, because those pages hold genuinely different developers — collapsing them
+  onto one URL would tell a search engine that different people are the same page. Past
+  rank 1000 the paginated series goes `noindex, follow`: 250,000 rows is 2,500 offset URLs
+  per sort, and burying the pages worth finding under 7,500 thin ones is a poor trade. The
+  depth is served by individually-indexed profile pages instead. `/search?…` is
+  `noindex, follow` for the same reason.
+- **Sharded sitemap.** `generateSitemaps` emits `/sitemap/0.xml` (static routes and every
+  place) and `/sitemap/N.xml` (profiles, 25,000 each), because the protocol caps one file
+  at 50,000 URLs. Note that Next emits no `/sitemap.xml` index, so `robots.ts` lists each
+  shard rather than advertising a path that 404s.
+- **AI crawlers are named and allowed** in `robots.txt` — nineteen of them, listed in
+  `AI_CRAWLERS`. This is a public dataset that exists to be cited, and an assistant reading
+  the site is a reader like any other. Naming them means a future decision to exclude one
+  is a visible edit rather than a silent default.
+- **JSON-LD on every route** (`lib/structured-data.ts`): `WebSite` with a `SearchAction`
+  that points at a search route which really works, a `Dataset` naming the measurement
+  window and the API endpoints, an `ItemList` per board, a `ProfilePage` per developer, and
+  breadcrumbs. Contribution counts are modelled as `InteractionCounter` — never
+  `aggregateRating`, which would earn a star snippet by inventing one.
+- **Open Graph images are generated from the live snapshot** (`app/opengraph-image.tsx`),
+  so the card carries the real developer count and the real name at rank one rather than a
+  stale PNG.
+
+## Analytics
+
+PostHog, off by default. `NEXT_PUBLIC_POSTHOG_KEY` is what turns it on; with no key the
+site makes no third-party request and shows no consent banner, which is what a fork or a
+preview deployment should do.
+
+When it is enabled, the library initialises with `opt_out_capturing_by_default` so that
+**no cookie is written before the banner is answered**. Initialising eagerly and opting out
+afterwards is the common shortcut, and it sets the cookie first. Pageviews are captured
+manually per navigation because App Router transitions never fire a document load, so
+PostHog's automatic pageview would record the entry page and nothing else.
 
 ## Design system
 
@@ -201,7 +297,7 @@ pnpm build && pnpm start        # in one shell
 node tests/shots.mjs            # in another
 ```
 
-`tests/shots.mjs` drives Playwright over all eleven routes at desktop and mobile, with
+`tests/shots.mjs` drives Playwright over all fifteen routes at desktop and mobile, with
 reduced motion on and off and with JavaScript disabled. It fails the run if any element
 is left below 5% opacity or heavily translated under reduced motion, if a no-JS page
 renders under 200 characters of text in `<main>`, or if any page logs a console error.
@@ -247,14 +343,24 @@ The short version; the full account is on `/methodology`.
 | `start` | `next start` | Serves the production build |
 | `lint` | `eslint .` | Flat config in `eslint.config.mjs` (`eslint-config-next`) |
 | `typecheck` | `tsc --noEmit` | TypeScript, `strict` |
-| `crawl` | `tsx scripts/crawler/index.ts` | Scheduled GitHub crawler — **not yet committed** |
-| `crawl:fixtures` | `tsx scripts/crawler/index.ts --fixtures` | Crawler against recorded fixtures — **not yet committed** |
+| `crawl` | `tsx scripts/crawler/index.ts` | Scheduled GitHub crawler. Pick a stage with `--tier=verify\|discover\|hydrate\|calendars\|supplement\|countries\|cities\|orgs\|repos` |
+| `crawl:fixtures` | `tsx scripts/crawler/index.ts --fixtures` | The whole pipeline against recorded fixtures — no network, no token |
 | `seed` | `tsx scripts/bootstrap-seed.ts` | Builds the bootstrap snapshot into `data/` |
-| `test` | `node --test "scripts/**/*.test.ts"` | Unit tests for the pipeline — **no test files yet** |
+| `build:index` | `tsx scripts/build-index.ts` | Rebuilds the search index; runs automatically as `prebuild` |
+| `test` | `node --test "scripts/**/*.test.ts"` | 49 pipeline unit tests, all offline |
 
-The Playwright sweep is not in `package.json`; run it directly with `node tests/shots.mjs`.
+Three Playwright scripts are deliberately not in `package.json`, because all of them need a
+server already running: `node tests/shots.mjs` (the accessibility sweep),
+`node tests/launch-media.mjs` (regenerates the Product Hunt gallery) and
+`node tests/launch-video.mjs` (records the 65-second demo tour). The two launch scripts
+photograph the live site, so their output always matches whatever the site is serving.
 
 ## Licence and attribution
+
+**This repository does not yet declare a licence**, which means default copyright applies
+and nobody else has permission to reuse it. That is worth fixing before the project is
+promoted anywhere. The `Dataset` structured data deliberately omits a `license` field until
+one exists, rather than asserting a licence that was never chosen.
 
 The bootstrap snapshot is derived from
 [gayanvoice/top-github-users](https://github.com/gayanvoice/top-github-users), with

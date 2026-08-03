@@ -1,7 +1,7 @@
 import { fail, handle, ok, readQuery } from "@/lib/api/http";
 import { searchDevelopers, type DeveloperFilters } from "@/lib/api/queries";
 
-const SORTS = ["contributions", "followers", "rank", "login"] as const;
+const SORTS = ["contributions", "followers", "streak", "rank", "login"] as const;
 
 export function GET(request: Request): Promise<Response> {
   return handle(async () => {

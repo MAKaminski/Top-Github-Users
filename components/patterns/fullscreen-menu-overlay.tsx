@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import { NAV_LINKS } from "@/components/nav-links";
+import { SearchBox } from "@/components/search-box";
 import { useReducedMotion } from "./use-reduced-motion";
 
 /**
@@ -91,6 +92,12 @@ export function FullscreenMenuOverlay() {
             >
               Close
             </button>
+          </div>
+
+          {/* The narrow-viewport home for search: the nav bar has no room for
+              it below xl, and this dialog is the only navigation surface there. */}
+          <div className="mt-[var(--space-sm)]">
+            <SearchBox />
           </div>
 
           <ul className="flex flex-1 flex-col justify-center gap-[var(--space-xs)]">

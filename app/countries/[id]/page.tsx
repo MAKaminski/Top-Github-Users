@@ -5,7 +5,9 @@ import { LeaderboardHeader, LeaderboardRow } from "@/components/leaderboard-rows
 import { ViewportStaggerReveal } from "@/components/patterns/viewport-stagger-reveal";
 import { ScrollProgressRule } from "@/components/patterns/scroll-progress-rule";
 import { FollowersScatter } from "@/components/charts/scatter";
+import { StructuredData } from "@/components/structured-data";
 import { getCountryBoard, getManifest } from "@/lib/data";
+import { breadcrumbSchema, placeSchema } from "@/lib/structured-data";
 import { flagOf } from "@/scripts-shared/flags";
 import { abbreviate, exact } from "@/lib/format";
 
@@ -23,9 +25,15 @@ export async function generateMetadata({
   const manifest = await getManifest();
   const place = manifest.countries.find((p) => p.id === id);
   if (!place) return {};
+  const description =
+    `The ${place.userCount.toLocaleString("en-US")} most active GitHub developers in ` +
+    `${place.name}, ranked by contributions over the trailing twelve months.`;
+
   return {
     title: `${place.name} leaderboard`,
-    description: `The most active GitHub developers in ${place.name}.`,
+    description,
+    alternates: { canonical: `/countries/${place.id}` },
+    openGraph: { title: `Top GitHub developers in ${place.name}`, description, url: `/countries/${place.id}` },
   };
 }
 
@@ -39,6 +47,16 @@ export default async function CountryPage({ params }: { params: Promise<{ id: st
 
   return (
     <>
+      <StructuredData
+        data={[
+          placeSchema(place, "country", `/countries/${place.id}`),
+          breadcrumbSchema([
+            { name: "Commitgraph", path: "/" },
+            { name: "Countries", path: "/countries" },
+            { name: place.name, path: `/countries/${place.id}` },
+          ]),
+        ]}
+      />
       <ScrollProgressRule />
 
       <section className="shell py-[var(--space-lg)]">
@@ -90,10 +108,23 @@ export default async function CountryPage({ params }: { params: Promise<{ id: st
           <LeaderboardHeader />
           <ViewportStaggerReveal>
             {board.entries.map((entry) => (
-              <LeaderboardRow key={entry.login} entry={entry} />
+              <LeaderboardRow key={entry.login} entry={entry} sparkline={false} />
             ))}
           </ViewportStaggerReveal>
         </div>
+
+        {/* This page is a ranked head, not the whole country. Search carries the
+            tail, because it reads the index rather than this board file. */}
+        <p className="prose mt-[var(--space-md)] text-caption text-muted">
+          Showing the top {exact(board.entries.length)} in {place.name}.{" "}
+          <Link
+            href={`/search?country=${place.id}&sort=contributions`}
+            className="underline underline-offset-4"
+          >
+            Search every tracked developer here
+          </Link>
+          , including those ranked below this page.
+        </p>
       </section>
 
       <section className="shell border-t border-rule py-[var(--space-lg)]">

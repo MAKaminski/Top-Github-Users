@@ -6,7 +6,12 @@ import { abbreviate, exact } from "@/lib/format";
 
 export const metadata: Metadata = {
   title: "Methodology",
-  description: "How Commitgraph's numbers are produced, and where they are wrong.",
+  description:
+    "How Commitgraph's numbers are produced and where they are wrong: the contribution window, " +
+    "private-contribution handling, location parsing, estimated calendars, and the accounts " +
+    "excluded as automation.",
+  alternates: { canonical: "/methodology" },
+  openGraph: { title: "Methodology · Commitgraph", url: "/methodology" },
 };
 
 export default async function MethodologyPage() {
@@ -60,10 +65,18 @@ export default async function MethodologyPage() {
               survivors are then looked up through GitHub&rsquo;s API.
             </p>
             <p className="mt-[var(--space-2xs)] text-muted">
+              Every board — worldwide, country and city — is then <em>derived</em> from that single
+              hydrated set by grouping it on the parsed location. That is what removed the old
+              ceiling: a location-scoped search returns at most a thousand results per query, so
+              the previous pipeline could never rank more than a thousand people anywhere, however
+              long it ran.
+            </p>
+            <p className="mt-[var(--space-2xs)] text-muted">
               The limit worth knowing: the archive only records <em>public</em> activity, so
               somebody working almost entirely in private repositories does not appear in it. A
-              smaller search pass covers that gap. Accounts firing thousands of events at a single
-              repository are dropped as automation before anything is looked up.
+              smaller search pass covers that gap by contributing names for the next hydration to
+              fetch. Accounts firing thousands of events at a single repository are dropped as
+              automation before anything is looked up.
             </p>
           </div>
 
@@ -79,13 +92,36 @@ export default async function MethodologyPage() {
           </div>
 
           <div>
+            <h2 className="text-h2">How deep the rankings go</h2>
+            <p className="mt-[var(--space-2xs)] text-muted">
+              The board is the whole snapshot, not a top hundred:{" "}
+              <Link href="/leaderboard" className="underline underline-offset-4">
+                every ranked developer
+              </Link>{" "}
+              is reachable, sortable by contributions, followers or streak, and searchable by
+              login, name, company or location. The ceiling is 250,000 developers, and it is a
+              storage decision rather than an API one — snapshots are committed to git so each one
+              can be diffed against the day before, and a corpus much past that size would be
+              rewritten wholesale on every crawl.
+            </p>
+          </div>
+
+          <div>
             <h2 className="text-h2">Measured against estimated</h2>
             <p className="mt-[var(--space-2xs)] text-muted">
-              Contribution <strong>totals</strong> and follower counts are measured. Where the
-              day-by-day calendar has not yet been fetched, the heatmap shape is a deterministic
-              estimate derived from the measured total — the same login always produces the same
-              calendar, and the total always matches exactly. Every estimated chart is labelled as
-              such. The scheduled crawler replaces estimates with the real calendar.
+              Contribution <strong>totals</strong> and follower counts are measured, for everyone.
+              The day-by-day calendar is not: it is by far the most expensive thing to fetch, so it
+              is bought for the top of the board and estimated below that. An estimated calendar is
+              derived deterministically from the measured total — the same login always produces
+              the same calendar, and the total always matches exactly.
+            </p>
+            <p className="mt-[var(--space-2xs)] text-muted">
+              This matters most for <strong>streaks</strong>, which can only be read off a
+              calendar. Ranking by streak therefore ranks measured and estimated values together,
+              and every estimated row is marked with <span className="mono">≈</span> — in the text,
+              not only in the colour. An estimated streak is a plausible shape, not a fact about
+              that person&rsquo;s week. The scheduled crawler replaces estimates with real
+              calendars as it reaches them.
             </p>
           </div>
 

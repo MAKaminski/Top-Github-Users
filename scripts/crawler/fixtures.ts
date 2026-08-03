@@ -16,6 +16,7 @@ import {
   decodeSearchRepositories,
   decodeSearchUsers,
   type ContributionWindow,
+  type EnrichOptions,
   type EnrichResult,
   type GitHubApi,
   type GraphQLBody,
@@ -64,14 +65,60 @@ export class FixtureClient implements GitHubApi {
    * Replays the recording in whatever order the caller asked for. Logins with
    * no recorded user come back as `skipped`, which is exactly how a live batch
    * reports a deleted or renamed account.
+   *
+   * `calendar: false` strips `weeks` from the replayed payload rather than
+   * ignoring the flag. Mirroring the real response matters: the whole point of
+   * the scalars-only pass is that the days are *absent*, and a fixture that
+   * quietly supplied them would leave the code path that copes with their
+   * absence untested.
    */
-  async enrichUsers(logins: string[], _window: ContributionWindow): Promise<EnrichResult> {
-    const data: Record<string, GraphUser | null> = {};
-    logins.forEach((login, index) => {
-      data[`u${index}`] = this.recorded.get(login) ?? null;
-    });
-    return decodeGraphQlUsers({ data } as GraphQLBody, logins);
+  async enrichUsers(
+    logins: string[],
+    _window: ContributionWindow,
+    options: EnrichOptions = {},
+  ): Promise<EnrichResult> {
+    const batchSize = 100;
+    const all: EnrichResult = { users: [], skipped: [] };
+
+    for (let start = 0, index = 0; start < logins.length; start += batchSize, index++) {
+      const batch = logins.slice(start, start + batchSize);
+      const data: Record<string, GraphUser | null> = {};
+
+      batch.forEach((login, position) => {
+        let user = this.recorded.get(login) ?? null;
+        if (user && options.calendar === false) user = withoutDays(user);
+        // Same reasoning as the days: the scalars pass genuinely does not
+        // receive repository nodes, and `languagesFrom` has to be exercised
+        // against their absence rather than always seeing them.
+        if (user && options.languages === false) user = withoutRepositoryNodes(user);
+        data[`u${position}`] = user;
+      });
+
+      const decoded = decodeGraphQlUsers({ data } as GraphQLBody, batch);
+      if (options.onBatch) await options.onBatch({ ...decoded, index });
+      else {
+        all.users.push(...decoded.users);
+        all.skipped.push(...decoded.skipped);
+      }
+    }
+
+    return all;
   }
+}
+
+/** The same user as a query without `languages` would return them: the
+ *  repository count survives, the per-repo nodes do not. */
+function withoutRepositoryNodes(user: GraphUser): GraphUser {
+  return { ...user, repositories: { totalCount: user.repositories.totalCount } };
+}
+
+/** The same user as the scalars-only query would return them. */
+function withoutDays(user: GraphUser): GraphUser {
+  const { weeks: _days, ...calendar } = user.contributionsCollection.contributionCalendar;
+  return {
+    ...user,
+    contributionsCollection: { ...user.contributionsCollection, contributionCalendar: calendar },
+  };
 }
 
 export async function loadFixtureClient(dir: string = FIXTURES_DIR): Promise<FixtureClient> {

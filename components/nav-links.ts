@@ -6,6 +6,7 @@
  *  init rather than failing loudly.
  */
 export const NAV_LINKS = [
+  { href: "/search", label: "Search" },
   { href: "/leaderboard", label: "Leaderboard" },
   { href: "/podium", label: "Top 10" },
   { href: "/countries", label: "Countries" },

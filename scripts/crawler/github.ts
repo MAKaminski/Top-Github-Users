@@ -34,29 +34,130 @@ const SEARCH_REQUESTS_PER_MINUTE = 30;
 /**
  * Alias batching.
  *
- * The standing rules are explicit: start at 100 and halve to 50 then 25 on a
- * query timeout. 100 aliases is a single point for a hundred profiles, which is
- * the whole reason hydration is affordable — at 25 we were paying four times
- * over for the same work.
+ * CLAUDE.md §1 says to start at 100 and halve on timeout, because 100 aliases
+ * cost a single point. The *points* part is true — a ten-alias query bills 1,
+ * same as a one-alias query — but 100 is unreachable for this selection, and
+ * the reason is not the rate limit at all.
+ *
+ * `contributionsCollection` makes GitHub aggregate a year of events per alias
+ * inside one query's execution budget, and that budget is what runs out. The
+ * `verify` tier measures the ceiling directly (see PROBE_SIZES in index.ts).
+ * Measured 2026-08-02, on a personal token:
+ *
+ *     1 alias   cost 1   0.5s   ok
+ *     2         cost 1   0.9s   ok
+ *     3         cost 1   1.3s   ok
+ *     5         cost 1   2.0s   ok
+ *    10         cost 1   3.4s   ok
+ *    25         —        7.0s   "Resource limits for this query exceeded."
+ *
+ * So: 10, and re-measure with `--tier=verify` rather than assuming it held.
+ * Note the shape of the failure at 25 — a structured GraphQL error naming the
+ * reason, not the gateway 502 an earlier run took at every size. Those 502s
+ * were GitHub being unwell, and reading them as a hard ceiling was wrong.
  *
  * The ladder is for TIMEOUTS specifically. Measured `rateLimit.cost` separately
  * shrinks the batch when a selection turns out heavier than expected; the two
  * mechanisms answer different failures and both are needed.
  */
-export const GRAPHQL_BATCH_START = 100;
-const GRAPHQL_BATCH_MIN = 5;
-const GRAPHQL_BATCH_MAX = 100;
-/** Halved in order on timeout, per the rules. */
-const GRAPHQL_BATCH_LADDER = [100, 50, 25] as const;
-/** Points we are willing to spend per enrichment request. One point per
- *  hundred logins is the documented shape; anything above that is a signal the
- *  selection grew, not a budget to spend. */
+export const GRAPHQL_BATCH_START = 10;
+const GRAPHQL_BATCH_MIN = 1;
+const GRAPHQL_BATCH_MAX = 10;
+/**
+ * Walked down in order on timeout, to the floor the client itself supports.
+ *
+ * It used to stop at 25 while `GRAPHQL_BATCH_MIN` was 5, so a batch that could
+ * not be served at 25 gave up with three viable sizes untried. That is not
+ * hypothetical: a real run took fifteen consecutive 502/504s walking
+ * 100 -> 50 -> 25 and then threw, losing 250,000 users of work.
+ *
+ * The floor is 1 because a single pathological account — someone with an
+ * enormous year — can exceed the executor's budget on its own. At size 1 there
+ * is nothing left to blame but that account, and it gets dead-lettered.
+ */
+const GRAPHQL_BATCH_LADDER = [10, 5, 3, 2, 1] as const;
+/** Points we are willing to spend per enrichment request. Every batch size we
+ *  can actually use bills 1, so this is a tripwire for the selection growing,
+ *  not a budget to spend. */
 const GRAPHQL_TARGET_COST = 1;
 /** Below this many points left in the hour, wait for the reset rather than
  *  burning the remainder and having the run die mid-place. */
 const GRAPHQL_RESERVE = 200;
 
+/**
+ * Enrichment requests in flight.
+ *
+ * §4 allows 4–8, and six was the arithmetic answer: a ten-alias query takes
+ * ~3.4s, so one worker reaches ~10,600 users an hour against a budget allowing
+ * 50,000, and six brings the two into line.
+ *
+ * Six earned a secondary rate limit within two minutes:
+ *
+ *     HTTP 403: You have exceeded a secondary rate limit. Please wait a few
+ *     minutes before you try again. For more on scraping GitHub and how it may
+ *     affect your rights…
+ *
+ * The limit that bites is not the concurrent-request cap — §2 allows 100 — it is
+ * **90 seconds of CPU time per 60 seconds of wall clock**. `contributionsCollection`
+ * aggregates a year of events per alias, which is expensive on GitHub's side as
+ * well as ours, so six queries of ~3.4s each in flight asks for roughly 20
+ * seconds of their CPU per 3.4 seconds of ours — an order of magnitude over.
+ *
+ * Three is what that budget actually affords, and the ceiling is GitHub's
+ * server CPU rather than anything measurable from here. Raising it back is not
+ * a tuning decision: a token in the secondary-limit penalty box collects
+ * nothing at all, and the warning names scraping. If throughput needs to
+ * improve, improve the filter in §7.2 instead.
+ */
+const CONCURRENCY = 3;
+const MAX_CONCURRENCY = 8;
+
+/**
+ * Clean batches at a reduced size before trying the next rung up.
+ *
+ * The ladder used to be one-way: `stepDownFrom` walked 10 -> 1 on timeouts and
+ * only `resetBatchSize` (after a dead-letter) ever went back up. A five-hour run
+ * took a few transient 502s in its first minutes, pinned itself to one alias per
+ * query, and spent the rest of the run at a tenth of the throughput it had just
+ * measured as achievable. Fifty is large enough that a genuinely unservable size
+ * is not retried every other batch, small enough to recover in seconds.
+ */
+const BATCH_RECOVERY_RUN = 50;
+
 const MAX_ATTEMPTS = 5;
+
+/**
+ * Gateway errors get more attempts than other failures, but not more time.
+ *
+ * A 502/504 is not billed against the rate limit, so retrying one costs only
+ * time — which is exactly the resource that then needs bounding. The first
+ * version of this raised the attempt count and left the 60-second backoff
+ * ceiling alone, and a probe spent twenty minutes on two thousand users without
+ * reporting anything: eight attempts backing off to a minute is ~3 minutes per
+ * rung, five rungs is ~15 minutes per batch, and three batches before the
+ * circuit breaker is three quarters of an hour to learn one fact.
+ *
+ * Attempts are therefore capped by a wall-clock deadline as well. A gateway
+ * that has not recovered in {@link REQUEST_DEADLINE_MS} is not going to inside
+ * a retry loop, and the batch ladder is a better answer than more waiting.
+ */
+const MAX_GATEWAY_ATTEMPTS = 8;
+/** Ceiling on one request's total wall clock, retries included. */
+const REQUEST_DEADLINE_MS = 45_000;
+/** Gateway retries back off fast — they are free, and the useful signal is
+ *  whether the *next* rung down works, not whether a longer wait helps. */
+const GATEWAY_BACKOFF_CEILING_MS = 8_000;
+
+/**
+ * Consecutive dead-lettered batches before the run gives up entirely.
+ *
+ * Dead-lettering exists so one pathological account cannot destroy a pass. It
+ * must not become a way to grind through a quarter of a million logins during a
+ * real outage, dropping every one of them and reporting "success". Three in a
+ * row with no batch served in between is not a poison record, it is the API
+ * being unavailable — and that deserves a failed job, loudly.
+ */
+const MAX_CONSECUTIVE_DEAD_LETTERS = 3;
 
 /** Returned in place of a body when the server answers 304. */
 export const NOT_MODIFIED = Symbol("not-modified");
@@ -117,7 +218,8 @@ export interface GraphUser {
     restrictedContributionsCount: number;
     contributionCalendar: {
       totalContributions: number;
-      weeks: ContributionWeek[];
+      /** Absent on a scalars-only pass — see {@link EnrichOptions.calendar}. */
+      weeks?: ContributionWeek[];
     };
   };
 }
@@ -139,10 +241,73 @@ export interface SearchOptions {
   max?: number;
 }
 
+export interface EnrichOptions {
+  /**
+   * Whether to request the day-by-day contribution calendar.
+   *
+   * This is the field that decides what a hydration pass costs. Everything else
+   * in the selection is a scalar; `weeks { contributionDays { … } }` is 371
+   * nodes *per alias*, so a 100-alias batch asks for 37,100 of them and the
+   * measured `rateLimit.cost` climbs accordingly. Hydrating a large corpus runs
+   * in two passes: scalars for everyone, days only for the depth that has a
+   * profile page to show them on.
+   *
+   * `contributionCalendar { totalContributions }` is kept either way. It is one
+   * scalar, and it is the authoritative twelve-month total — the per-type counts
+   * beneath it are public-only and do not sum to it, so dropping it would mean
+   * ranking on a number GitHub does not agree with.
+   *
+   * Defaults to true, which is what every place-scoped tier wants.
+   */
+  calendar?: boolean;
+  /**
+   * Whether to request each user's top repositories, for the language mix.
+   *
+   * The same trap as `calendar`, and it caused the same failure: it adds a
+   * *sorted connection* per alias —
+   * `repositories(first: 25, orderBy: { field: STARGAZERS … })` — so a
+   * 100-alias batch asks GitHub to rank a hundred people's repositories and
+   * aggregate a hundred twelve-month contribution collections in one request.
+   * That is the shape that comes back as a gateway 502 rather than data.
+   *
+   * Only the ~10,000 profile pages render the language donut, so only the
+   * calendars pass needs this. Defaults to the client-level setting.
+   */
+  languages?: boolean;
+  /**
+   * Called after each batch is decoded.
+   *
+   * Lets a caller persist as it goes rather than holding a quarter of a million
+   * records until the end — the standing rules require a resumable job, and a
+   * run that only writes at the end is not one.
+   */
+  onBatch?: (batch: EnrichResult & { index: number }) => void | Promise<void>;
+  /**
+   * Wall-clock time (epoch ms) after which no new batch is started.
+   *
+   * This exists because of a specific, expensive failure. A 250,000-login pass
+   * ran for five hours inside a 350-minute job, hydrating 26,783 developers —
+   * and then the runner cancelled the job. `runHydrate` publishes its boards
+   * *after* this method returns, so being killed mid-loop meant every one of
+   * those records died with the runner: the journal that held them lives in a
+   * gitignored directory, and the commit step never ran.
+   *
+   * A crawler that cannot be interrupted safely is not resumable, whatever its
+   * journal does. So the run now stops itself with time to spare, lets its
+   * caller publish, and leaves a committed board for the next run to resume
+   * from. In-flight batches are allowed to finish; only new ones are refused.
+   */
+  deadline?: number;
+}
+
 export interface GitHubApi {
   searchUsers(query: string, options?: SearchOptions): Promise<SearchUser[]>;
   searchRepositories(query: string, options?: SearchOptions): Promise<SearchRepository[]>;
-  enrichUsers(logins: string[], window: ContributionWindow): Promise<EnrichResult>;
+  enrichUsers(
+    logins: string[],
+    window: ContributionWindow,
+    options?: EnrichOptions,
+  ): Promise<EnrichResult>;
 }
 
 /**
@@ -161,6 +326,31 @@ export function requireToken(env: NodeJS.ProcessEnv = process.env): string {
     );
   }
   return token;
+}
+
+/**
+ * The message for a 401.
+ *
+ * Worth spelling out because the failure is confusing: the workflow's token
+ * gate passes (the secret exists and is non-empty), the budget block prints,
+ * and only then does GitHub reject the credential. "Bad credentials" alone
+ * sends people to check whether the secret is set, which it is.
+ */
+export function badCredentials(): string {
+  return [
+    "GitHub rejected the token (HTTP 401 Bad credentials).",
+    "",
+    "The secret exists — an empty one is caught earlier — so the value itself is not accepted.",
+    "In order of likelihood:",
+    "  1. The token expired, or was revoked. Classic tokens expire by default.",
+    "  2. Only part of it was pasted. A classic token is `ghp_` + 36 characters;",
+    "     a fine-grained one is `github_pat_` + rather more.",
+    "  3. It is a fine-grained token still awaiting approval, or scoped to an",
+    "     organisation that has not granted it.",
+    "",
+    "Generate a replacement at https://github.com/settings/tokens/new — no scopes are needed,",
+    "everything this crawler reads is public — and update the GH_CRAWL_TOKEN repository secret.",
+  ].join("\n");
 }
 
 /** Escapes a free-text place name for use inside a quoted search qualifier. */
@@ -341,13 +531,27 @@ export function fatalGraphQlError(body: GraphQLBody): string | null {
   return fatal.length > 0 ? fatal.map((error) => error.message ?? error.type).join("; ") : null;
 }
 
-/** The enrichment document, built for however many logins are in this batch. */
-export function buildUserQuery(count: number, options: { languages?: boolean } = {}): string {
+/**
+ * The enrichment document, built for however many logins are in this batch.
+ *
+ * `calendar: false` drops the only connection field in the selection. What is
+ * left is scalars, so the query bills at the shape the batching maths assumes —
+ * about one point per hundred logins — and a corpus-wide pass is affordable.
+ * With the calendar in, each alias adds 371 nodes and the same batch costs
+ * several times as much. Both are legitimate; they are different passes.
+ */
+export function buildUserQuery(
+  count: number,
+  options: { languages?: boolean; calendar?: boolean } = {},
+): string {
   const repositories = options.languages
     ? "repositories(first: 25, isFork: false, ownerAffiliations: OWNER, " +
       "orderBy: { field: STARGAZERS, direction: DESC }) " +
       "{ totalCount nodes { primaryLanguage { name } } }"
     : "repositories { totalCount }";
+
+  const days =
+    options.calendar === false ? "" : "\n        weeks { contributionDays { date contributionCount } }";
 
   const params = ["$from: DateTime!", "$to: DateTime!"];
   const fields: string[] = [];
@@ -371,8 +575,7 @@ export function buildUserQuery(count: number, options: { languages?: boolean } =
       totalPullRequestReviewContributions
       restrictedContributionsCount
       contributionCalendar {
-        totalContributions
-        weeks { contributionDays { date contributionCount } }
+        totalContributions${days}
       }
     }
   }`,
@@ -408,7 +611,26 @@ export interface ClientOptions {
   languages?: boolean;
   /** Persisted ETags. Omit and every REST call is unconditional. */
   etags?: ConditionalStore;
+  /** Where a unit of work goes when it cannot be served at any batch size.
+   *  Omit and such a batch is dropped with a log line but no record. */
+  deadLetter?: DeadLetterSink;
+  /** Enrichment requests in flight at once. §4 allows 4–8 and the constructor
+   *  clamps to that; higher does not raise the ceiling, it just earns a
+   *  secondary-limit block. Tests set 1 to keep batch order deterministic. */
+  concurrency?: number;
+  /** Injected so a test can exercise the retry and batch-ladder paths without
+   *  actually waiting out the backoff. Production never sets it — and when a
+   *  test replaces `sleepImpl`, `now` has to advance with it or the wall-clock
+   *  deadline never fires. */
+  sleepImpl?: (ms: number) => Promise<unknown>;
+  now?: () => number;
   log?: (message: string) => void;
+}
+
+/** The slice of `limiter.ts`'s DeadLetter this client needs, named structurally
+ *  so github.ts does not depend on the limiter module. */
+export interface DeadLetterSink {
+  record(unit: string, error: string, attempts: number): Promise<void>;
 }
 
 export class GitHubClient implements GitHubApi {
@@ -420,20 +642,135 @@ export class GitHubClient implements GitHubApi {
   fetchImpl: typeof fetch;
   languages: boolean;
   etags?: ConditionalStore;
+  deadLetter?: DeadLetterSink;
+  sleep: (ms: number) => Promise<unknown>;
+  now: () => number;
   /** Counts requests served from a 304, for the per-run budget report. */
   conditionalHits = 0;
   log: (message: string) => void;
   searchLimiter: TokenBucket;
   batchSize: number;
+  concurrency: number;
+  /** Consecutive successful batches since the last size change — see
+   *  BATCH_RECOVERY_RUN. */
+  private successesAtSize = 0;
 
   constructor(options: ClientOptions) {
     this.token = options.token;
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.languages = options.languages ?? false;
     this.etags = options.etags;
+    this.deadLetter = options.deadLetter;
+    this.sleep = options.sleepImpl ?? sleep;
+    this.now = options.now ?? Date.now;
     this.log = options.log ?? (() => {});
     this.searchLimiter = new TokenBucket(SEARCH_REQUESTS_PER_MINUTE);
     this.batchSize = GRAPHQL_BATCH_START;
+    // Clamped rather than trusted: §4's ceiling is 8, and a caller passing 32
+    // would trade the whole run for a secondary-limit block. 1 stays reachable
+    // because tests need batches to complete in a known order.
+    this.concurrency = Math.max(1, Math.min(MAX_CONCURRENCY, options.concurrency ?? CONCURRENCY));
+  }
+
+  /**
+   * One point, spent to answer "will this token work at all?".
+   *
+   * Worth its own call because of where the alternative fails: hydration reads
+   * 3.5 GB of GH Archive and prints a budget before it touches the API, so a
+   * bad credential surfaces four minutes and a full discovery pass into the
+   * run. This turns that into a one-second failure at the top of the job.
+   */
+  async verifyToken(): Promise<string> {
+    const body = (await this.request(GRAPHQL_ENDPOINT, {
+      method: "POST",
+      body: JSON.stringify({ query: "query Verify { viewer { login } rateLimit { remaining } }" }),
+    })) as { data?: { viewer?: { login?: string }; rateLimit?: { remaining?: number } } };
+
+    const login = body.data?.viewer?.login;
+    if (!login) throw new Error(badCredentials());
+
+    this.log(`token accepted for @${login}; ${body.data?.rateLimit?.remaining ?? "?"} points left`);
+    return login;
+  }
+
+  /**
+   * N users in one query, using the same selection hydration uses.
+   *
+   * This exists to answer a question that cost a lot to guess at: when
+   * enrichment 502s, is it the *size* of the batch or the query itself? A run
+   * walked 100 -> 50 -> 25 -> 10 -> 5 with the light selection and took gateway
+   * errors at every rung while a one-alias request answered in a second. So the
+   * ceiling sits somewhere below 5, and the only honest way to find it is to
+   * ask GitHub one alias count at a time.
+   *
+   * Deliberately impatient: two attempts, not the eight a hydrating batch gets.
+   * A probe that rides out a gateway wobble reports the wrong ceiling, and a
+   * size that needs three tries to answer is not a size we can run 250,000
+   * users through anyway.
+   *
+   * Returns the measured cost so the §8 budget can stop being an assumption.
+   */
+  async probeEnrichment(
+    logins: string[],
+    window: ContributionWindow,
+  ): Promise<{
+    size: number;
+    ok: boolean;
+    cost: number | null;
+    resolved: number;
+    elapsedMs: number;
+    detail: string;
+  }> {
+    const startedAt = this.now();
+    const variables: Record<string, string> = { from: window.from, to: window.to };
+    logins.forEach((login, index) => {
+      variables[aliasFor(index)] = login;
+    });
+
+    const failure = (detail: string) => ({
+      size: logins.length,
+      ok: false,
+      cost: null,
+      resolved: 0,
+      elapsedMs: this.now() - startedAt,
+      detail,
+    });
+
+    try {
+      const body = (await this.request(
+        GRAPHQL_ENDPOINT,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            query: buildUserQuery(logins.length, { languages: false, calendar: false }),
+            variables,
+          }),
+        },
+        { maxAttempts: 2 },
+      )) as GraphQLBody;
+
+      const fatal = fatalGraphQlError(body);
+      if (fatal) return failure(`GraphQL error: ${fatal}`);
+
+      const decoded = decodeGraphQlUsers(body, logins);
+      const limit = rateLimitFrom(body);
+      return {
+        size: logins.length,
+        // Every alias has to come back. A partial answer at size 10 is not a
+        // working size 10 — it is a size we would have to dead-letter half of.
+        ok: decoded.users.length === logins.length,
+        cost: limit?.cost ?? null,
+        resolved: decoded.users.length,
+        elapsedMs: this.now() - startedAt,
+        detail:
+          decoded.users.length === logins.length
+            ? `all ${logins.length} resolved`
+            : `only ${decoded.users.length}/${logins.length} resolved` +
+              (decoded.skipped.length ? ` (skipped ${decoded.skipped.join(", ")})` : ""),
+      };
+    } catch (error) {
+      return failure(error instanceof Error ? error.message : String(error));
+    }
   }
 
   async searchUsers(query: string, options: SearchOptions = {}): Promise<SearchUser[]> {
@@ -495,69 +832,183 @@ export class GitHubClient implements GitHubApi {
     return out.slice(0, max);
   }
 
-  async enrichUsers(logins: string[], window: ContributionWindow): Promise<EnrichResult> {
+  async enrichUsers(
+    logins: string[],
+    window: ContributionWindow,
+    options: EnrichOptions = {},
+  ): Promise<EnrichResult> {
     const users: GraphUser[] = [];
     const skipped: string[] = [];
+    const collect = options.onBatch === undefined;
+    let batchIndex = 0;
+    let dropped = 0;
+    let consecutiveDrops = 0;
 
-    for (let index = 0; index < logins.length; ) {
-      const batch = logins.slice(index, index + this.batchSize);
-      index += batch.length;
+    // Shared work state. `cursor` walks the corpus; `requeued` holds logins
+    // from a batch that has to be reissued at a smaller size, and is drained
+    // first so a stepped-down rung is retried promptly rather than at the end.
+    let cursor = 0;
+    const requeued: string[] = [];
+    let journal = Promise.resolve();
 
-      const variables: Record<string, string> = { from: window.from, to: window.to };
-      batch.forEach((login, position) => {
-        variables[aliasFor(position)] = login;
-      });
+    // Set when the run must wind down: either the caller's deadline passed, or
+    // the hourly budget ran out with less time left than the reset needs.
+    let stopping = false;
 
-      let body: GraphQLBody;
-      try {
-        body = (await this.request(GRAPHQL_ENDPOINT, {
-          method: "POST",
-          body: JSON.stringify({
-            query: buildUserQuery(batch.length, { languages: this.languages }),
-            variables,
-          }),
-        })) as GraphQLBody;
-      } catch (error) {
-        // A timeout is not a reason to fail the tier — it is the signal to
-        // halve. Rewind so the same logins are retried at the smaller size;
-        // a smaller batch is cheaper than a retry at the same size.
-        if (isTimeout(error) && this.stepBatchSizeDown()) {
-          index -= batch.length;
-          this.log(`GraphQL timed out; halving batch to ${this.batchSize}`);
+    const outOfTime = () => options.deadline !== undefined && this.now() >= options.deadline;
+
+    const takeBatch = (): string[] | null => {
+      if (stopping || outOfTime()) return null;
+      if (requeued.length) return requeued.splice(0, this.batchSize);
+      if (cursor >= logins.length) return null;
+      const batch = logins.slice(cursor, cursor + this.batchSize);
+      cursor += batch.length;
+      return batch;
+    };
+
+    const worker = async (): Promise<void> => {
+      for (let batch = takeBatch(); batch !== null; batch = takeBatch()) {
+        // Captured before the request so a concurrent worker stepping the
+        // ladder down mid-flight cannot make this batch look stale.
+        const sizeSent = this.batchSize;
+
+        const variables: Record<string, string> = { from: window.from, to: window.to };
+        batch.forEach((login, position) => {
+          variables[aliasFor(position)] = login;
+        });
+
+        let body: GraphQLBody;
+        try {
+          body = (await this.request(GRAPHQL_ENDPOINT, {
+            method: "POST",
+            body: JSON.stringify({
+              query: buildUserQuery(batch.length, {
+                languages: options.languages ?? this.languages,
+                calendar: options.calendar,
+              }),
+              variables,
+            }),
+          })) as GraphQLBody;
+        } catch (error) {
+          // A timeout is not a reason to fail the tier — it is the signal to
+          // step down. Requeue the logins so they are retried at the smaller
+          // size; a smaller batch is cheaper than a retry at the same size.
+          if (isOversized(error) && this.stepDownFrom(sizeSent)) {
+            requeued.unshift(...batch);
+            continue;
+          }
+          if (!isOversized(error)) throw error;
+
+          // Bottom of the ladder. §4: never retry a unit of work more than five
+          // times — write it to the dead-letter file and move on. Throwing here
+          // would discard every batch already hydrated, which is how a run that
+          // had collected nothing yet still managed to lose 250,000 users.
+          await this.deadLetter?.record(
+            `enrich:${batch[0]}..${batch[batch.length - 1]}`,
+            error instanceof Error ? error.message : String(error),
+            GRAPHQL_BATCH_LADDER.length,
+          );
+          dropped += batch.length;
+          consecutiveDrops++;
+
+          if (consecutiveDrops >= MAX_CONSECUTIVE_DEAD_LETTERS) {
+            throw new Error(
+              `GraphQL served none of the last ${consecutiveDrops} batches at any size ` +
+                `(${GRAPHQL_BATCH_LADDER.join(", ")}). Treating this as an outage rather than ` +
+                `dead-lettering the remaining ${logins.length - cursor + requeued.length} logins. ` +
+                `Last error: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+
+          this.log(
+            `batch of ${batch.length} unserved at every batch size; dead-lettered ` +
+              `(${dropped} logins dropped so far) and continuing`,
+          );
+          this.resetBatchSize();
           continue;
         }
-        throw error;
-      }
 
-      const fatal = fatalGraphQlError(body);
-      if (fatal) {
-        if (/timeout/i.test(fatal) && this.stepBatchSizeDown()) {
-          index -= batch.length;
-          this.log(`GraphQL reported a timeout; halving batch to ${this.batchSize}`);
-          continue;
+        const fatal = fatalGraphQlError(body);
+        if (fatal) {
+          if (isOversized(fatal) && this.stepDownFrom(sizeSent)) {
+            requeued.unshift(...batch);
+            continue;
+          }
+          throw new Error(`GraphQL enrichment failed: ${fatal}`);
         }
-        throw new Error(`GraphQL enrichment failed: ${fatal}`);
+
+        consecutiveDrops = 0;
+
+        const decoded = decodeGraphQlUsers(body, batch);
+        // With a per-batch consumer the caller owns the records and this method
+        // holds nothing: that is what lets a 250,000-login pass run in bounded
+        // memory and resume from where it stopped.
+        if (collect) {
+          users.push(...decoded.users);
+          skipped.push(...decoded.skipped);
+        } else {
+          // Serialised, unlike the requests. The consumer appends to a journal
+          // file, and interleaved appends from six workers would corrupt the
+          // very thing that makes the run resumable.
+          const index = batchIndex;
+          journal = journal.then(() => options.onBatch?.({ ...decoded, index }));
+          await journal;
+        }
+        batchIndex++;
+
+        // A false return means "the hourly budget is spent and waiting for the
+        // reset would overrun the deadline". Winding down here is what lets the
+        // caller publish what has been collected; sleeping instead is how the
+        // last run spent its final 29 minutes idle and then lost everything.
+        if (!(await this.adaptBatchSize(rateLimitFrom(body), batch.length, options.deadline))) {
+          stopping = true;
+          return;
+        }
       }
+    };
 
-      const decoded = decodeGraphQlUsers(body, batch);
-      users.push(...decoded.users);
-      skipped.push(...decoded.skipped);
+    // Concurrency does not raise the 5,000-point ceiling; it is what lets us
+    // reach it. A ten-alias query takes ~3.4s, so one worker hydrates ~10,600
+    // users an hour against a budget that allows 50,000 — the run would spend
+    // five sixths of its wall clock waiting on the socket. §4 caps this at 8.
+    await Promise.all(Array.from({ length: this.concurrency }, () => worker()));
 
-      await this.adaptBatchSize(rateLimitFrom(body), batch.length);
+    if (dropped > 0) {
+      this.log(`${dropped} logins were never served and are listed in the dead-letter file`);
     }
-
     return { users, skipped };
   }
 
   /**
-   * Walk down the 100 -> 50 -> 25 ladder. Returns false at the bottom, so a
-   * genuine failure still surfaces instead of looping forever on a batch size
-   * that was never the problem.
+   * Back to the top of the ladder after a dead-letter.
+   *
+   * The batch that failed may have contained one pathological account rather
+   * than being too large — staying at the floor for the remaining quarter of a
+   * million would turn a 2,500-query pass into a 50,000-query one. If the size
+   * really is the problem the ladder simply walks down again.
    */
-  private stepBatchSizeDown(): boolean {
+  private resetBatchSize(): void {
+    this.batchSize = GRAPHQL_BATCH_START;
+    this.successesAtSize = 0;
+  }
+
+  /**
+   * Walk down the 10 -> 5 -> 3 -> 2 -> 1 ladder. Returns false at the bottom,
+   * so a genuine failure still surfaces instead of looping forever on a batch
+   * size that was never the problem.
+   *
+   * `sentAt` is the size the failing batch was issued at. With several workers
+   * in flight they all fail at roughly the same moment on a rung that is too
+   * big, and letting each of them step would drop the ladder to its floor on
+   * the strength of one bad rung. Only the first report moves it.
+   */
+  private stepDownFrom(sentAt: number): boolean {
+    if (this.batchSize < sentAt) return true; // another worker already stepped down
     const next = GRAPHQL_BATCH_LADDER.find((size) => size < this.batchSize);
     if (next === undefined) return false;
     this.batchSize = next;
+    this.successesAtSize = 0;
+    this.log(`GraphQL could not serve ${sentAt} aliases; batch now ${next}`);
     return true;
   }
 
@@ -566,8 +1017,12 @@ export class GitHubClient implements GitHubApi {
    * measurement set the batch size so a heavier-than-expected selection shrinks
    * batches instead of exhausting the hourly budget halfway through a tier.
    */
-  private async adaptBatchSize(limit: RateLimitInfo | null, batchSize: number): Promise<void> {
-    if (!limit) return;
+  private async adaptBatchSize(
+    limit: RateLimitInfo | null,
+    batchSize: number,
+    deadline?: number,
+  ): Promise<boolean> {
+    if (!limit) return true;
 
     // Cost is per query, not per login. One point for a hundred logins is the
     // expected shape; if the API bills more, shrink so a single request never
@@ -585,18 +1040,57 @@ export class GitHubClient implements GitHubApi {
       this.log(`node count ${limit.nodeCount} near the 500k cap; batch now ${this.batchSize}`);
     }
 
-    if (limit.remaining > GRAPHQL_RESERVE) return;
+    // Successful batches at a reduced size are evidence the reduction was for a
+    // transient failure rather than a real ceiling. Without this the ladder is a
+    // one-way ratchet: a handful of 502s early in a five-hour pass pinned the
+    // batch to 1 for the rest of it, turning 50,000 users an hour into 5,000.
+    if (this.batchSize < GRAPHQL_BATCH_START && ++this.successesAtSize >= BATCH_RECOVERY_RUN) {
+      const next = [...GRAPHQL_BATCH_LADDER].reverse().find((size) => size > this.batchSize);
+      if (next !== undefined) {
+        this.batchSize = Math.min(next, GRAPHQL_BATCH_MAX);
+        this.successesAtSize = 0;
+        this.log(`${BATCH_RECOVERY_RUN} clean batches; trying ${this.batchSize} aliases again`);
+      }
+    }
 
-    const waitMs = Math.max(0, Date.parse(limit.resetAt) - Date.now()) + 1000;
+    if (limit.remaining > GRAPHQL_RESERVE) return true;
+
+    const waitMs = Math.max(0, Date.parse(limit.resetAt) - this.now()) + 1000;
+
+    // Waiting past the deadline buys nothing: the caller would be killed before
+    // it could use the refreshed budget, and everything collected so far would
+    // go with it. Stop instead, and let the caller publish.
+    if (deadline !== undefined && this.now() + waitMs > deadline) {
+      this.log(
+        `GraphQL budget down to ${limit.remaining}; the ${Math.ceil(waitMs / 60_000)}min reset ` +
+          "runs past this run's deadline, so stopping here to publish what is collected",
+      );
+      return false;
+    }
+
     this.log(`GraphQL budget down to ${limit.remaining}; waiting ${Math.ceil(waitMs / 1000)}s`);
-    await sleep(waitMs);
+    await this.sleep(waitMs);
+    return true;
   }
 
-  private async request(url: string, init: RequestInit): Promise<unknown> {
+  private async request(
+    url: string,
+    init: RequestInit,
+    retry: { maxAttempts?: number } = {},
+  ): Promise<unknown> {
     let lastError = "";
+    let attempts = 0;
+    let sawGateway = false;
+    const startedAt = this.now();
     const conditional = init.method !== "POST" ? this.etags?.get(url) : undefined;
 
-    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    // Grows to MAX_GATEWAY_ATTEMPTS the first time a 502/503/504 is seen, so a
+    // flaky front end gets ridden out without giving every other failure the
+    // same latitude.
+    let budget = retry.maxAttempts ?? MAX_ATTEMPTS;
+
+    for (let attempt = 0; attempt < budget; attempt++) {
+      attempts = attempt + 1;
       const response = await this.fetchImpl(url, {
         ...init,
         headers: {
@@ -623,28 +1117,51 @@ export class GitHubClient implements GitHubApi {
       const text = await response.text();
       lastError = `HTTP ${response.status}: ${text.slice(0, 300)}`;
 
+      // A 401 is never worth retrying and never worth a raw dump: the token is
+      // present (the run got this far) but GitHub will not accept it, and the
+      // fix is always the same handful of things.
+      if (response.status === 401) throw new Error(badCredentials());
+
       const advised = retryAfterMs(response.headers);
-      const shouldRetry =
-        isTransient(response.status) ||
-        isSecondaryLimit(response.status, text) ||
-        advised !== null;
+      const transient = isTransient(response.status);
+      const shouldRetry = transient || isSecondaryLimit(response.status, text) || advised !== null;
 
       if (!shouldRetry) throw new Error(`${url} — ${lastError}`);
+      if (transient) {
+        budget = retry.maxAttempts ?? MAX_GATEWAY_ATTEMPTS;
+        sawGateway = true;
+      }
 
-      const waitMs = advised ?? backoffMs(attempt);
+      // Attempts left, but no time left. Stop here so the caller can try a
+      // smaller batch instead of waiting out a gateway that is not recovering.
+      const elapsed = this.now() - startedAt;
+      if (elapsed > REQUEST_DEADLINE_MS) {
+        throw new Error(
+          `${url} — gave up after ${attempts} attempts in ${Math.round(elapsed / 1000)}s. ${lastError}`,
+        );
+      }
+
+      const ceiling = sawGateway && advised === null ? GATEWAY_BACKOFF_CEILING_MS : MAX_BACKOFF_MS;
+      const waitMs = Math.min(advised ?? backoffMs(attempt), ceiling);
       this.log(`retrying ${new URL(url).pathname} in ${Math.ceil(waitMs / 1000)}s — ${lastError}`);
-      await sleep(Math.min(waitMs, MAX_BACKOFF_MS));
+      await this.sleep(waitMs);
     }
 
-    throw new Error(`${url} — gave up after ${MAX_ATTEMPTS} attempts. ${lastError}`);
+    throw new Error(`${url} — gave up after ${attempts} attempts. ${lastError}`);
   }
 }
 
-/** GitHub reports query timeouts inconsistently — as a 502, as a plain socket
- *  timeout, or as a GraphQL error naming it. Match all three. */
-export function isTimeout(error: unknown): boolean {
+/**
+ * "This query asked for too much" — the one failure the batch ladder answers.
+ *
+ * GitHub reports it four ways: a 502, a 504, a plain socket timeout, and a
+ * structured `Resource limits for this query exceeded.` The last is the polite
+ * one, and it is what a 25-alias `contributionsCollection` query actually
+ * returns; missing it meant an over-sized batch threw instead of stepping down.
+ */
+export function isOversized(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
-  return /timeout|timed out|ETIMEDOUT|502|504/i.test(message);
+  return /timeout|timed out|ETIMEDOUT|502|504|resource limits/i.test(message);
 }
 
 /** The trailing year the contribution calendar covers, ending on `date`. */

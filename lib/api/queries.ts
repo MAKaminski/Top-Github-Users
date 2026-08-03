@@ -10,7 +10,14 @@ import {
   getWorldwide,
 } from "@/lib/data";
 import { calendarFor, monthlyFrom, streaksFrom } from "@/lib/calendar";
-import { loadSearchIndex, type SearchRow } from "@/lib/api/search-index";
+import {
+  isSort,
+  loadIndexOrder,
+  loadIndexTable,
+  type IndexTable,
+  type SearchRow,
+  type Sort,
+} from "@/lib/api/search-index";
 import type {
   HistorySeries,
   Leaderboard,
@@ -31,7 +38,9 @@ import type {
  * no network.
  */
 
-export const MAX_PAGE = 200;
+/** Raised from 200 for the infinite-scrolling leaderboard: at 200 a reader
+ *  scrolling to rank 100,000 costs 500 round trips. */
+export const MAX_PAGE = 500;
 export const DEFAULT_PAGE = 50;
 
 export interface Page<T> {
@@ -80,20 +89,91 @@ export function parseScope(scope: string): Scope | { error: string } {
   };
 }
 
+/** Turns an index row into a leaderboard row at a given position. */
+function entryFromIndex(table: IndexTable, index: number, rank: number, movement: boolean) {
+  const row = table.rowAt(index);
+  return {
+    rank,
+    login: row.login,
+    name: row.name,
+    avatarUrl: row.avatarUrl,
+    location: row.location,
+    company: row.company,
+    followers: row.followers,
+    total: row.total,
+    public: row.public,
+    private: row.private,
+    countryId: row.countryId,
+    cityId: row.cityId,
+    // Movement compares this snapshot's rank with the last one's. That is only
+    // meaningful inside the ordering the history was recorded in, so a board
+    // sorted by followers or streak shows no arrows rather than comparing a
+    // followers position against a contributions position.
+    previousRank: movement ? row.previousRank : null,
+    hasProfile: row.hasProfile,
+    streak: row.streak,
+    calendarMeasured: row.calendarMeasured,
+  } satisfies LeaderboardEntry;
+}
+
+/**
+ * A page of a leaderboard, in any of the three orderings.
+ *
+ * The worldwide board is served from the search index rather than from
+ * `data/leaderboard/worldwide.json`, because the index is the only artefact
+ * that holds the *whole* corpus: the board file is a ranked head, and reading
+ * page 400 out of it would return nothing. Country and city scopes are small
+ * enough to sort in place, and are enriched from the index so every scope
+ * carries a streak.
+ */
 export async function getLeaderboard(
   scope: string,
   limit = DEFAULT_PAGE,
   offset = 0,
-): Promise<{ board: Leaderboard; page: Page<LeaderboardEntry> } | { error: string }> {
+  sort: Sort = "contributions",
+): Promise<
+  { board: Leaderboard; page: Page<LeaderboardEntry>; sort: Sort } | { error: string }
+> {
   const parsed = parseScope(scope);
   if ("error" in parsed) return parsed;
 
+  const movement = sort === "contributions";
+
+  if (parsed.kind === "worldwide") {
+    const [table, order, stored] = await Promise.all([
+      loadIndexTable(),
+      loadIndexOrder(),
+      getWorldwide(),
+    ]);
+
+    const ranking = order[sort];
+    const size = Math.min(Math.max(1, limit), MAX_PAGE);
+    const start = Math.max(0, Math.min(offset, ranking.length));
+    const slice = ranking.slice(start, start + size);
+
+    return {
+      // `entries` deliberately carries only the requested page: materialising a
+      // quarter of a million rows to describe one of them is the exact cost
+      // this index exists to avoid. `page.total` is the honest corpus size.
+      board: {
+        scope: "worldwide",
+        name: "Worldwide",
+        generatedAt: stored.generatedAt,
+        entries: [],
+      },
+      page: {
+        items: slice.map((rowIndex, i) => entryFromIndex(table, rowIndex, start + i + 1, movement)),
+        total: ranking.length,
+        limit: size,
+        offset: start,
+        hasMore: start + size < ranking.length,
+      },
+      sort,
+    };
+  }
+
   const board =
-    parsed.kind === "worldwide"
-      ? await getWorldwide()
-      : parsed.kind === "country"
-        ? await getCountryBoard(parsed.id)
-        : await getCityBoard(parsed.id);
+    parsed.kind === "country" ? await getCountryBoard(parsed.id) : await getCityBoard(parsed.id);
 
   if (!board) {
     return {
@@ -101,8 +181,35 @@ export async function getLeaderboard(
     };
   }
 
-  return { board, page: paginate(board.entries, limit, offset) };
+  const table = await loadIndexTable();
+  const enriched = board.entries.map((entry) => {
+    const index = table.indexOf(entry.login);
+    if (index < 0) return { ...entry, streak: null, calendarMeasured: null };
+    const row = table.rowAt(index);
+    return { ...entry, streak: row.streak, calendarMeasured: row.calendarMeasured };
+  });
+
+  const ordered =
+    sort === "contributions"
+      ? enriched
+      : [...enriched].sort((a, b) =>
+          sort === "followers"
+            ? b.followers - a.followers || a.login.localeCompare(b.login)
+            : (b.streak?.longest ?? 0) - (a.streak?.longest ?? 0) ||
+              (b.streak?.current ?? 0) - (a.streak?.current ?? 0) ||
+              a.login.localeCompare(b.login),
+        );
+
+  const ranked = ordered.map((entry, i) => ({
+    ...entry,
+    rank: movement ? entry.rank : i + 1,
+    previousRank: movement ? entry.previousRank : null,
+  }));
+
+  return { board, page: paginate(ranked, limit, offset), sort };
 }
+
+export { isSort, type Sort };
 
 /* ------------------------------------------------------------------ places */
 
@@ -165,46 +272,71 @@ export interface DeveloperFilters {
   maxContributions?: number;
   minFollowers?: number;
   hasProfile?: boolean;
-  sort?: "contributions" | "followers" | "rank" | "login";
+  sort?: "contributions" | "followers" | "streak" | "rank" | "login";
 }
 
+/**
+ * Free-text and filtered search across the whole corpus.
+ *
+ * Matching runs over the index's raw columns and only the returned page is
+ * decoded into objects. At 6,000 developers the difference is invisible; at
+ * 250,000 it is the difference between a search and an out-of-memory error.
+ */
 export async function searchDevelopers(
   filters: DeveloperFilters = {},
   limit = DEFAULT_PAGE,
   offset = 0,
 ): Promise<Page<SearchRow>> {
-  const rows = await loadSearchIndex();
+  const table = await loadIndexTable();
   const needle = filters.query?.trim().toLowerCase();
   const company = filters.company?.trim().toLowerCase();
 
-  const matched = rows.filter((row) => {
-    if (filters.countryId && row.countryId !== filters.countryId) return false;
-    if (filters.cityId && row.cityId !== filters.cityId) return false;
-    if (filters.hasProfile !== undefined && row.hasProfile !== filters.hasProfile) return false;
-    if (filters.minContributions !== undefined && row.total < filters.minContributions) return false;
-    if (filters.maxContributions !== undefined && row.total > filters.maxContributions) return false;
-    if (filters.minFollowers !== undefined && row.followers < filters.minFollowers) return false;
-    if (company && !(row.company ?? "").toLowerCase().includes(company)) return false;
+  const matched: number[] = [];
+  for (let i = 0; i < table.count; i++) {
+    if (filters.countryId && table.countryAt(i) !== filters.countryId) continue;
+    if (filters.cityId && table.cityAt(i) !== filters.cityId) continue;
+    if (filters.hasProfile !== undefined && table.hasProfileAt(i) !== filters.hasProfile) continue;
+
+    const total = table.totalAt(i);
+    if (filters.minContributions !== undefined && total < filters.minContributions) continue;
+    if (filters.maxContributions !== undefined && total > filters.maxContributions) continue;
+    if (filters.minFollowers !== undefined && table.followersAt(i) < filters.minFollowers) continue;
+    if (company && !table.companyAt(i).toLowerCase().includes(company)) continue;
+
     if (needle) {
       const haystack =
-        `${row.login} ${row.name ?? ""} ${row.company ?? ""} ${row.location ?? ""}`.toLowerCase();
-      if (!haystack.includes(needle)) return false;
+        `${table.loginAt(i)} ${table.nameAt(i)} ${table.companyAt(i)} ${table.locationAt(i)}`.toLowerCase();
+      if (!haystack.includes(needle)) continue;
     }
-    return true;
-  });
+
+    matched.push(i);
+  }
 
   const sort = filters.sort ?? "contributions";
+  const login = (i: number) => table.loginAt(i);
   matched.sort((a, b) => {
-    if (sort === "followers") return b.followers - a.followers || a.login.localeCompare(b.login);
-    if (sort === "login") return a.login.localeCompare(b.login);
-    if (sort === "rank") {
-      return (a.worldwideRank ?? Infinity) - (b.worldwideRank ?? Infinity) ||
-        a.login.localeCompare(b.login);
+    if (sort === "followers") {
+      return table.followersAt(b) - table.followersAt(a) || login(a).localeCompare(login(b));
     }
-    return b.total - a.total || b.followers - a.followers || a.login.localeCompare(b.login);
+    if (sort === "streak") {
+      return table.streakLongestAt(b) - table.streakLongestAt(a) || login(a).localeCompare(login(b));
+    }
+    if (sort === "login") return login(a).localeCompare(login(b));
+    if (sort === "rank") {
+      return (
+        (table.worldwideRankAt(a) ?? Infinity) - (table.worldwideRankAt(b) ?? Infinity) ||
+        login(a).localeCompare(login(b))
+      );
+    }
+    return (
+      table.totalAt(b) - table.totalAt(a) ||
+      table.followersAt(b) - table.followersAt(a) ||
+      login(a).localeCompare(login(b))
+    );
   });
 
-  return paginate(matched, limit, offset);
+  const page = paginate(matched, limit, offset);
+  return { ...page, items: page.items.map((index) => table.rowAt(index)) };
 }
 
 /**
@@ -246,9 +378,9 @@ export function resolveCalendar(
 }
 
 export async function getDeveloper(login: string): Promise<DeveloperResult> {
-  const rows = await loadSearchIndex();
-  const key = login.trim().toLowerCase().replace(/^@/, "");
-  const indexRow = rows.find((row) => row.login.toLowerCase() === key) ?? null;
+  const table = await loadIndexTable();
+  const index = table.indexOf(login);
+  const indexRow = index >= 0 ? table.rowAt(index) : null;
 
   const user = await getUser(indexRow?.login ?? login.replace(/^@/, ""));
   if (user) {

@@ -160,8 +160,8 @@ A REST mirror of the same data is at \`/api/v1\`, described by \`/api/openapi.js
 | --- | --- |
 | \`commitgraph_describe_dataset\` | The dictionary: every field, its meaning and provenance, and all valid scope ids. **Start here.** |
 | \`commitgraph_list_places\` | Country and city ids, with totals. |
-| \`commitgraph_get_leaderboard\` | A ranked board for \`worldwide\`, \`country:{id}\` or \`city:{id}\`. |
-| \`commitgraph_search_developers\` | Find developers by name, company, location or numeric filters. |
+| \`commitgraph_get_leaderboard\` | A ranked board for \`worldwide\`, \`country:{id}\` or \`city:{id}\`, sorted by contributions, followers or streak. |
+| \`commitgraph_search_developers\` | Find developers by name, company, location or numeric filters. Sees the whole snapshot. |
 | \`commitgraph_get_developer\` | One developer in full, with calendar and streaks. |
 | \`commitgraph_compare_developers\` | Two to five developers side by side. |
 | \`commitgraph_get_organizations\` | Employers ranked by their developers' combined output. |
@@ -175,9 +175,12 @@ A REST mirror of the same data is at \`/api/v1\`, described by \`/api/openapi.js
 - **Location is free text** on a GitHub profile. Country comes from searching that field; city is
   parsed from the same string. This is the largest source of error and it affects every site in
   this space equally.
-- **Measured against estimated:** totals and follower counts are measured. Where the day-by-day
-  calendar has not been crawled, the heatmap *shape* is a deterministic estimate derived from the
-  measured total. Every record says which it is.
+- **Measured against estimated:** totals and follower counts are measured for everyone. The
+  day-by-day calendar is the expensive field, so it is fetched for the top of the board and
+  *estimated* below it — deterministically, from the measured total. Every record says which it
+  is, via \`calendarMeasured\`. This matters for \`sort=streak\`, which reads off the calendar and
+  therefore ranks measured and estimated values together.
+- **Depth:** \`worldwide\` is the entire snapshot, not a top-N. Page through it with \`offset\`.
 - **Automation is excluded.** Accounts above 300,000 contributions in twelve months — over 820 a
   day without a break — are removed from rankings and listed openly rather than dropped silently.
 - **Coverage:** many ranked developers have no stored profile record. \`commitgraph_get_developer\`
@@ -324,30 +327,43 @@ const listPlacesTool = tool({
 const getLeaderboardTool = tool({
   name: "commitgraph_get_leaderboard",
   description:
-    "A ranked board for a scope: 'worldwide', 'country:{id}' or 'city:{id}'. Ranked by " +
-    "contributions, ties broken on followers then login.",
+    "A ranked board for a scope: 'worldwide', 'country:{id}' or 'city:{id}'. Sortable by " +
+    "contributions (the default), followers or streak; ties always break on login, so paging is " +
+    "stable. The worldwide scope covers the entire snapshot — page through it with offset rather " +
+    "than assuming a top-N. Streak comes from the contribution calendar, which is fetched for " +
+    "the top of the board and estimated below it: rows carry calendarMeasured, and a streak " +
+    "ranking mixes the two.",
   schema: z.object({
     scope: z.string().default("worldwide").describe("worldwide, country:{id}, or city:{id}."),
+    sort: z
+      .enum(["contributions", "followers", "streak"])
+      .default("contributions")
+      .describe("Ranking metric. 'streak' ranks on the longest streak in the trailing year."),
     limit,
     offset,
     response_format: format,
   }),
-  handler: (args) => getLeaderboard(args.scope, args.limit, args.offset),
+  handler: (args) => getLeaderboard(args.scope, args.limit, args.offset, args.sort),
   render: (data: Awaited<ReturnType<typeof getLeaderboard>>) => {
     if ("error" in data) return data.error;
+    const estimated = data.page.items.filter((e) => e.calendarMeasured === false).length;
     return [
       `# ${data.board.name} — snapshot ${data.board.generatedAt}`,
       "",
-      `Showing ${data.page.items.length} of ${exact(data.page.total)}.`,
+      `Showing ${data.page.items.length} of ${exact(data.page.total)}, sorted by ${data.sort}.`,
+      data.sort === "streak" && estimated > 0
+        ? `${estimated} of these streaks are estimated, not measured (marked ≈).`
+        : "",
       "",
       table(
-        ["#", "Login", "Name", "Contributions", "Followers", "Profile"],
+        ["#", "Login", "Name", "Contributions", "Followers", "Streak", "Profile"],
         data.page.items.map((e) => [
           e.rank,
           `\`${e.login}\``,
           e.name ?? "—",
           exact(e.total),
           exact(e.followers),
+          e.streak ? `${e.calendarMeasured === false ? "≈" : ""}${e.streak.longest}d` : "—",
           e.hasProfile ? "yes" : "row only",
         ]),
       ),
@@ -360,7 +376,8 @@ const searchDevelopersTool = tool({
   name: "commitgraph_search_developers",
   description:
     "Find developers by free text over login, name, company and location, combined with numeric " +
-    "and place filters. The primary retrieval tool.",
+    "and place filters. The primary retrieval tool, and it sees the entire snapshot — including " +
+    "everyone ranked below the depth a leaderboard page shows.",
   schema: z.object({
     query: z.string().max(120).optional().describe("Free text over login, name, company, location."),
     country_id: z.string().optional(),
@@ -370,7 +387,13 @@ const searchDevelopersTool = tool({
     max_contributions: z.number().int().min(0).optional(),
     min_followers: z.number().int().min(0).optional(),
     has_profile: z.boolean().optional().describe("Restrict to developers with a stored record."),
-    sort: z.enum(["contributions", "followers", "rank", "login"]).default("contributions"),
+    sort: z
+      .enum(["contributions", "followers", "streak", "rank", "login"])
+      .default("contributions")
+      .describe(
+        "'streak' ranks on the longest streak in the trailing year; check calendarMeasured on " +
+          "each row, because a streak from an estimated calendar is a shape, not a measurement.",
+      ),
     limit,
     offset,
     response_format: format,

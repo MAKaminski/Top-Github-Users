@@ -60,6 +60,10 @@ export const leaderboardEntrySchema = z.object({
   cityId: z.string().nullable(),
   previousRank: z.number().int().nullable(),
   hasProfile: z.boolean(),
+  /** Attached from the search index when a board is served, not stored in the
+   *  committed board files — see `lib/types.ts`. */
+  streak: z.object({ current: z.number().int(), longest: z.number().int() }).nullish(),
+  calendarMeasured: z.boolean().nullish(),
 });
 
 export const placeSchema = z.object({
