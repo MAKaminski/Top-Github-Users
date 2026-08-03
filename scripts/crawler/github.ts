@@ -87,14 +87,29 @@ const GRAPHQL_RESERVE = 200;
 /**
  * Enrichment requests in flight.
  *
- * §4: 4–8, never higher. It does not raise the 5,000-point ceiling — it is what
- * lets a run reach it. A ten-alias query takes ~3.4s, so a single-threaded pass
- * hydrates ~10,600 users an hour against a budget that allows 50,000; five
- * sixths of the wall clock would be spent waiting on the socket. Six workers
- * put the two roughly in line, and `adaptBatchSize` still parks the whole pool
- * when the hourly points run low.
+ * §4 allows 4–8, and six was the arithmetic answer: a ten-alias query takes
+ * ~3.4s, so one worker reaches ~10,600 users an hour against a budget allowing
+ * 50,000, and six brings the two into line.
+ *
+ * Six earned a secondary rate limit within two minutes:
+ *
+ *     HTTP 403: You have exceeded a secondary rate limit. Please wait a few
+ *     minutes before you try again. For more on scraping GitHub and how it may
+ *     affect your rights…
+ *
+ * The limit that bites is not the concurrent-request cap — §2 allows 100 — it is
+ * **90 seconds of CPU time per 60 seconds of wall clock**. `contributionsCollection`
+ * aggregates a year of events per alias, which is expensive on GitHub's side as
+ * well as ours, so six queries of ~3.4s each in flight asks for roughly 20
+ * seconds of their CPU per 3.4 seconds of ours — an order of magnitude over.
+ *
+ * Three is what that budget actually affords, and the ceiling is GitHub's
+ * server CPU rather than anything measurable from here. Raising it back is not
+ * a tuning decision: a token in the secondary-limit penalty box collects
+ * nothing at all, and the warning names scraping. If throughput needs to
+ * improve, improve the filter in §7.2 instead.
  */
-const CONCURRENCY = 6;
+const CONCURRENCY = 3;
 const MAX_CONCURRENCY = 8;
 
 /**

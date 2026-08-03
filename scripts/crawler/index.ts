@@ -1156,33 +1156,47 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
   let batches = 0;
   let ranked = done.size;
 
-  await context.api.enrichUsers(remaining, window, {
-    deadline: hydrationDeadline(),
-    calendar: false,
-    // The heavy sorted connection. Off here and on for the calendars pass —
-    // leaving it on is what made this query unservable at any batch size.
-    languages: false,
-    onBatch: async ({ users: decoded, skipped: missing }) => {
-      const batch: RankedUser[] = [];
-      for (const user of decoded) {
-        const record = toRankedUser(user, { avatarUrl: avatars.get(user.login) });
-        if (record.contributions.total <= 0) continue;
-        batch.push(record);
-      }
-      await journal.append(batch);
-      ranked += batch.length;
-      skipped.push(...missing);
+  // Collect, but never let a thrown outage take the collected work with it.
+  //
+  // The circuit breaker exists to fail loudly when GitHub stops serving, and it
+  // should — but throwing straight out of here skips `publishHydrated` below, so
+  // a run that hydrated tens of thousands of developers and *then* met an outage
+  // committed none of them. Publish first, re-raise after: the job still goes
+  // red, and the next run resumes from a board rather than from nothing.
+  let outage: unknown = null;
+  try {
+    await context.api.enrichUsers(remaining, window, {
+      deadline: hydrationDeadline(),
+      calendar: false,
+      // The heavy sorted connection. Off here and on for the calendars pass —
+      // leaving it on is what made this query unservable at any batch size.
+      languages: false,
+      onBatch: async ({ users: decoded, skipped: missing }) => {
+        const batch: RankedUser[] = [];
+        for (const user of decoded) {
+          const record = toRankedUser(user, { avatarUrl: avatars.get(user.login) });
+          if (record.contributions.total <= 0) continue;
+          batch.push(record);
+        }
+        await journal.append(batch);
+        ranked += batch.length;
+        skipped.push(...missing);
 
-      // One line per batch, as the standing rules require: this is the
-      // smallest unit at which a run can be seen going wrong.
-      if (++batches % 100 === 0 || decoded.length === 0) {
-        console.log(
-          `  batch ${String(batches).padStart(5)} · ${ranked.toLocaleString()} ranked · ` +
-            `${skipped.length} unresolved`,
-        );
-      }
-    },
-  });
+        // One line per batch, as the standing rules require: this is the
+        // smallest unit at which a run can be seen going wrong.
+        if (++batches % 100 === 0 || decoded.length === 0) {
+          console.log(
+            `  batch ${String(batches).padStart(5)} · ${ranked.toLocaleString()} ranked · ` +
+              `${skipped.length} unresolved`,
+          );
+        }
+      },
+    });
+  } catch (error) {
+    outage = error;
+    console.error(`\nHydration stopped early: ${error instanceof Error ? error.message : error}`);
+    console.error("Publishing what was collected before re-raising, so the run is not wasted.");
+  }
 
   // Read back what was written, including anything an earlier interrupted run
   // contributed. Flagged accounts are separated here rather than at write time
@@ -1205,6 +1219,10 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
   );
 
   await publishHydrated(context, users);
+
+  // Re-raised only after publishing, so the job still goes red and somebody
+  // looks at it — but the work it managed to collect is committed either way.
+  if (outage) throw outage;
 }
 
 /**
