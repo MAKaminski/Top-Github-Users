@@ -280,3 +280,34 @@ test("the install page states the endpoint a client is meant to be given", async
   assert.match(html, /api\/mcp/, "the connect page must print the endpoint");
   assert.match(html, /claude mcp add --transport http/, "…and the Claude Code command");
 });
+
+test("every tool carries the annotations the connector directory requires", async () => {
+  const { body } = await rpc("tools/list");
+
+  for (const tool of body.result.tools) {
+    // "All tools must include a `title` and the applicable `readOnlyHint` or
+    // `destructiveHint`." A listing missing these is rejected before a reviewer
+    // looks at what the tools actually do.
+    assert.ok(tool.title, `${tool.name} needs a title`);
+    assert.ok(tool.annotations, `${tool.name} needs annotations`);
+    assert.equal(tool.annotations.title, tool.title);
+    assert.equal(
+      typeof tool.annotations.readOnlyHint,
+      "boolean",
+      `${tool.name} must declare readOnlyHint`,
+    );
+    assert.notEqual(
+      tool.annotations.readOnlyHint,
+      tool.annotations.destructiveHint,
+      `${tool.name} cannot be both read-only and destructive`,
+    );
+
+    // This server serves a committed snapshot and has no write path, so a
+    // destructive tool here means someone added a capability without revisiting
+    // the safety story.
+    assert.equal(tool.annotations.readOnlyHint, true, `${tool.name} must be read-only`);
+    assert.equal(tool.annotations.openWorldHint, false, `${tool.name} reads a closed corpus`);
+
+    assert.ok(tool.name.length <= 64, `${tool.name} exceeds the 64-character limit`);
+  }
+});

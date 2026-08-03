@@ -30,11 +30,32 @@ This server is public and read-only over one committed snapshot. It has no acces
 /** Tool arguments arrive untyped; zod both validates them and is the source the
  *  advertised inputSchema is generated from, so the two can never disagree. */
 function toolDescriptors() {
-  return TOOLS.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: z.toJSONSchema(tool.schema, { io: "input" }),
-  }));
+  return TOOLS.map((tool) => {
+    const readOnly = tool.readOnly ?? true;
+    return {
+      name: tool.name,
+      title: tool.title,
+      description: tool.description,
+      inputSchema: z.toJSONSchema(tool.schema, { io: "input" }),
+      /**
+       * Behavioural hints. `readOnlyHint` is what lets a client run a tool
+       * without confirming every call, and every tool here qualifies: the
+       * server reads one committed snapshot and has no write path.
+       *
+       * `openWorldHint: false` is the honest answer for a closed corpus — this
+       * server does not reach out to GitHub, or anywhere else, at request time.
+       * A client that assumes otherwise would be right to treat the results as
+       * live, and they are not.
+       */
+      annotations: {
+        title: tool.title,
+        readOnlyHint: readOnly,
+        destructiveHint: !readOnly,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    };
+  });
 }
 
 export async function handleRpc(request: JsonRpcRequest): Promise<unknown | null> {

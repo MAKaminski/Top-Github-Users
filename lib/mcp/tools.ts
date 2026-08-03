@@ -34,18 +34,37 @@ const offset = z.number().int().min(0).default(0).describe("Rows to skip, for pa
 
 export interface Tool<S extends z.ZodType = z.ZodType> {
   name: string;
+  /** Human-readable label, shown in the client's permission and tool UI.
+   *  Required by the connector directory: a listing whose tools have no title
+   *  is rejected before a reviewer looks at what they do. */
+  title: string;
   description: string;
   schema: S;
   handler: (args: z.infer<S>) => Promise<unknown>;
   render: (data: never) => string;
+  /**
+   * Whether the tool only reads. Defaults to true, because this server has no
+   * write surface at all — it serves one committed snapshot and cannot mutate
+   * anything, so a tool here is read-only unless somebody adds a capability
+   * that does not currently exist.
+   *
+   * Stated as a field rather than hardcoded at the descriptor layer so that
+   * adding a write tool later is a deliberate act with a visible `false`,
+   * rather than a silent inheritance of the wrong annotation. `readOnlyHint`
+   * is what lets a client run a tool without prompting on every call, so
+   * getting it wrong in that direction is a real safety question.
+   */
+  readOnly?: boolean;
 }
 
 function tool<S extends z.ZodType>(definition: {
   name: string;
+  title: string;
   description: string;
   schema: S;
   handler: (args: z.infer<S>) => Promise<unknown>;
   render: (data: never) => string;
+  readOnly?: boolean;
 }): Tool<S> {
   return definition;
 }
@@ -126,6 +145,7 @@ function developerBlock(result: DeveloperResult): string {
 
 const getIntegrationGuide = tool({
   name: "commitgraph_get_integration_guide",
+  title: "Integration guide",
   description:
     "Describes what this server is, every tool it exposes, how to connect from Claude Code or " +
     "any MCP client, what the data means, and where it is wrong. Call this first if you are a " +
@@ -192,6 +212,7 @@ filesystems, databases or user data.`;
 
 const describeDataset = tool({
   name: "commitgraph_describe_dataset",
+  title: "Describe the dataset",
   description:
     "The dictionary of what is available: snapshot date and provenance, all counts and totals, " +
     "every field with its meaning, and the complete list of valid scope ids. Call this before " +
@@ -284,6 +305,7 @@ const FIELD_DICTIONARY = [
 
 const listPlacesTool = tool({
   name: "commitgraph_list_places",
+  title: "List countries and cities",
   description:
     "List countries and cities with their scope ids, ISO-2 code, region, developer count and " +
     "contribution totals. Use this to discover valid ids before calling get_leaderboard.",
@@ -323,6 +345,7 @@ const listPlacesTool = tool({
 
 const getLeaderboardTool = tool({
   name: "commitgraph_get_leaderboard",
+  title: "Get a leaderboard",
   description:
     "A ranked board for a scope: 'worldwide', 'country:{id}' or 'city:{id}'. Ranked by " +
     "contributions, ties broken on followers then login.",
@@ -358,6 +381,7 @@ const getLeaderboardTool = tool({
 
 const searchDevelopersTool = tool({
   name: "commitgraph_search_developers",
+  title: "Search developers",
   description:
     "Find developers by free text over login, name, company and location, combined with numeric " +
     "and place filters. The primary retrieval tool.",
@@ -415,6 +439,7 @@ const searchDevelopersTool = tool({
 
 const getDeveloperTool = tool({
   name: "commitgraph_get_developer",
+  title: "Get one developer",
   description:
     "One developer in full: contributions, ranks, contribution calendar, streaks and monthly " +
     "totals. If the developer is ranked but has no stored profile record, the leaderboard row is " +
@@ -429,6 +454,7 @@ const getDeveloperTool = tool({
 
 const compareDevelopersTool = tool({
   name: "commitgraph_compare_developers",
+  title: "Compare developers",
   description: "Two to five developers side by side on the same measures.",
   schema: z.object({
     logins: z.array(z.string().min(1).max(64)).min(2).max(5),
@@ -471,6 +497,7 @@ const compareDevelopersTool = tool({
 
 const getOrganizationsTool = tool({
   name: "commitgraph_get_organizations",
+  title: "List organizations",
   description:
     "Organizations ranked by the combined contributions of tracked developers who name them in " +
     "their profile — not by follower count. Drawn from a free-text company field.",
@@ -498,6 +525,7 @@ const getOrganizationsTool = tool({
 
 const getRankHistoryTool = tool({
   name: "commitgraph_get_rank_history",
+  title: "Get rank history",
   description:
     "Rank movement across snapshots for a scope. Reports plainly when there are too few " +
     "snapshots to plot rather than returning an empty series.",
@@ -524,6 +552,7 @@ const getRankHistoryTool = tool({
 
 const getStatisticsTool = tool({
   name: "commitgraph_get_statistics",
+  title: "Dataset statistics",
   description:
     "Aggregate distributions across the snapshot: contribution percentiles, the public/private " +
     "split, per-region totals, and the log-log correlation between followers and contributions.",
@@ -559,6 +588,7 @@ const getStatisticsTool = tool({
 
 const getRepositoriesTool = tool({
   name: "commitgraph_get_repositories",
+  title: "List repositories",
   description:
     "The repository board. Produced by the scheduled crawler; returns an explicit empty state " +
     "until that has run, rather than placeholder rows.",
@@ -589,6 +619,7 @@ const getRepositoriesTool = tool({
 
 const getFlaggedTool = tool({
   name: "commitgraph_get_flagged_accounts",
+  title: "Accounts excluded as automation",
   description:
     "Accounts excluded from every ranking as automation — above 300,000 contributions in twelve " +
     "months. Published rather than dropped silently so the rule can be audited.",
