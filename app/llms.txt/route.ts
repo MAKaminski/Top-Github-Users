@@ -3,6 +3,7 @@ import { CORS_HEADERS, baseUrlFrom, handle } from "@/lib/api/http";
 import { getManifest } from "@/lib/api/queries";
 import { loadSearchIndex } from "@/lib/api/search-index";
 import { PROMPTS } from "@/lib/mcp/prompts";
+import { DEMO_VIDEO } from "@/lib/site";
 import { PROTOCOL_VERSION } from "@/lib/mcp/protocol";
 import { TOOLS } from "@/lib/mcp/tools";
 
@@ -117,7 +118,9 @@ ${excluded}
 - ${base}/countries and ${base}/cities — place indexes
 - ${base}/u/{login} — a developer's profile
 - ${base}/methodology — how the numbers are made, and where they are wrong
-- ${base}/connect — how to add this server to Claude and other MCP clients
+- ${base}/connect — how to add this server to Claude and other MCP clients${
+      DEMO_VIDEO ? `\n- ${DEMO_VIDEO.url} — video walkthrough of adding it to Claude` : ""
+    }
 `;
 
     return new Response(body, {

@@ -4,7 +4,7 @@ import { getManifest } from "@/lib/api/queries";
 import { PROMPTS } from "@/lib/mcp/prompts";
 import { TOOLS } from "@/lib/mcp/tools";
 import { PROTOCOL_VERSION, SUPPORTED_PROTOCOLS } from "@/lib/mcp/protocol";
-import { INSTALL_COMMANDS, MARKETPLACE_NAME, PLUGIN_NAME, REPO_SLUG } from "@/lib/site";
+import { DEMO_VIDEO, INSTALL_COMMANDS, MARKETPLACE_NAME, PLUGIN_NAME, REPO_SLUG } from "@/lib/site";
 
 /**
  * Discovery document for the MCP server.
@@ -61,6 +61,10 @@ export function GET(request: Request): Promise<Response> {
        */
       install: {
         page: `${base}/connect`,
+        // Omitted entirely rather than sent as null: a client reading this
+        // document should find a walkthrough URL or find nothing, not a key
+        // that looks like a broken link.
+        ...(DEMO_VIDEO ? { walkthroughVideo: DEMO_VIDEO.url } : {}),
         claudeConnector: {
           // Claude's hosted surfaces take a URL and nothing else: the server is
           // public, so there is no OAuth step and no credential to configure.

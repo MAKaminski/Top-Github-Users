@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { MARKETPLACE_NAME, MCP_URL, PLUGIN_NAME, SITE_URL } from "../lib/site.ts";
+import { DEMO_VIDEO, MARKETPLACE_NAME, MCP_URL, PLUGIN_NAME, SITE_URL } from "../lib/site.ts";
 
 const root = join(import.meta.dirname, "..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -108,4 +108,21 @@ test("every published URL points at the production host", () => {
   ]) {
     assert.doesNotMatch(read(path), /localhost|127\.0\.0\.1/, `${path} must not ship a local URL`);
   }
+});
+
+test("the walkthrough video is either absent or a real published URL", () => {
+  // Null is the shipped default. The failure this guards is a placeholder —
+  // a "coming soon" or an unlisted draft URL committed during editing, which
+  // lights up the /connect card, the discovery document and llms.txt at once
+  // and sends every reader to a dead page.
+  if (DEMO_VIDEO === null) return;
+
+  assert.match(DEMO_VIDEO.url, /^https:\/\//, "the video URL must be https");
+  assert.match(
+    DEMO_VIDEO.url,
+    /^https:\/\/(www\.youtube\.com\/watch\?v=|youtu\.be\/)[\w-]{11}/,
+    "expected a canonical YouTube watch URL with a full 11-character id",
+  );
+  assert.ok(DEMO_VIDEO.title.length > 8, "the card needs a real title");
+  assert.match(DEMO_VIDEO.durationLabel, /^\d+:\d{2}$/, "duration reads as m:ss");
 });

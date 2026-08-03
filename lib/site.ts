@@ -29,6 +29,24 @@ export const REPO_URL = `https://github.com/${REPO_SLUG}`;
 export const MARKETPLACE_NAME = "commitgraph";
 export const PLUGIN_NAME = "commitgraph";
 
+/**
+ * The published walkthrough video, or null until one exists.
+ *
+ * Null is the shipped default on purpose. Every surface that mentions the video
+ * — the /connect page, the discovery document, llms.txt — is conditional on
+ * this being set, so the site never carries a "watch the demo" affordance that
+ * goes nowhere. Publish the video, paste the URL here, and all three light up
+ * together; there is no second place to remember.
+ *
+ * `durationLabel` is written by hand rather than fetched: reading it would mean
+ * calling the YouTube API at build time for a string that changes once.
+ */
+export const DEMO_VIDEO: {
+  url: string;
+  title: string;
+  durationLabel: string;
+} | null = null;
+
 /** Named once so the /connect page, the discovery document and the README
  *  cannot drift from each other. */
 export const INSTALL_COMMANDS = {

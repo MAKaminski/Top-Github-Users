@@ -4,7 +4,7 @@ import { PROMPTS } from "@/lib/mcp/prompts";
 import { TOOLS } from "@/lib/mcp/tools";
 import { getManifest } from "@/lib/data";
 import { exact } from "@/lib/format";
-import { INSTALL_COMMANDS, MCP_URL, REPO_SLUG, SITE_URL } from "@/lib/site";
+import { DEMO_VIDEO, INSTALL_COMMANDS, MCP_URL, REPO_SLUG, SITE_URL } from "@/lib/site";
 
 export const metadata: Metadata = {
   title: "Connect",
@@ -74,6 +74,30 @@ export default async function ConnectPage() {
           </p>
           <Command>{MCP_URL}</Command>
         </div>
+
+        {/* Rendered only once a video exists — see DEMO_VIDEO in lib/site.ts.
+            A link out rather than an embedded player: an iframe would load
+            YouTube on every view of this page, for a video most readers will
+            not watch, and the steps below are the faster path anyway. */}
+        {DEMO_VIDEO ? (
+          <a
+            href={DEMO_VIDEO.url}
+            className="group mt-[var(--space-md)] flex max-w-[38rem] items-center gap-[var(--space-sm)] border border-rule p-[var(--space-sm)] transition-colors hover:border-accent"
+          >
+            <span
+              aria-hidden
+              className="grid size-12 shrink-0 place-items-center rounded-full border border-rule text-caption transition-colors group-hover:border-accent"
+            >
+              ▶
+            </span>
+            <span className="flex flex-col gap-[var(--space-2xs)]">
+              <span className="text-body">{DEMO_VIDEO.title}</span>
+              <span className="text-caption text-muted">
+                Watch on YouTube · {DEMO_VIDEO.durationLabel}
+              </span>
+            </span>
+          </a>
+        ) : null}
       </section>
 
       <div
