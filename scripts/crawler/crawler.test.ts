@@ -662,6 +662,139 @@ test("the probe reports a size as working only when every alias comes back", asy
   );
 });
 
+test("hydration stops at its deadline instead of being killed mid-loop", async () => {
+  // The failure this pins: run 30767109823 collected 26,783 developers over five
+  // hours, was cancelled by the job timeout, and committed none of them —
+  // `publishHydrated` runs after `enrichUsers` returns, so being killed inside
+  // the loop threw the whole pass away. Returning normally is what lets the
+  // caller publish and the next run resume.
+  let clock = 0;
+  const client = new GitHubClient({
+    token: "t",
+    concurrency: 1,
+    sleepImpl: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
+    fetchImpl: async (_url, init) => {
+      // Every request advances the fake clock, so the deadline is reached by
+      // serving batches rather than by sleeping.
+      clock += 1000;
+      const body = JSON.parse(String((init as RequestInit).body)) as {
+        variables: Record<string, string>;
+      };
+      const aliases = Object.keys(body.variables).filter((k) => k !== "from" && k !== "to");
+      return Response.json({
+        data: {
+          rateLimit: { cost: 1, limit: 5000, remaining: 4999, resetAt: "", nodeCount: 1 },
+          ...Object.fromEntries(
+            aliases.map((alias) => [
+              alias,
+              {
+                login: body.variables[alias],
+                name: null,
+                avatarUrl: "",
+                location: null,
+                company: null,
+                bio: null,
+                followers: { totalCount: 1 },
+                repositories: { totalCount: 1 },
+                contributionsCollection: {
+                  totalCommitContributions: 1,
+                  totalPullRequestContributions: 0,
+                  totalIssueContributions: 0,
+                  totalPullRequestReviewContributions: 0,
+                  restrictedContributionsCount: 0,
+                  contributionCalendar: { totalContributions: 1 },
+                },
+              },
+            ]),
+          ),
+        },
+      });
+    },
+  });
+
+  const logins = Array.from({ length: 1000 }, (_, i) => `dev${i}`);
+  const result = await client.enrichUsers(
+    logins,
+    { from: "a", to: "b" },
+    { calendar: false, deadline: 5_000 },
+  );
+
+  // It returns rather than throwing or running to completion, and it returns
+  // real records — the point is that the caller gets to keep them.
+  assert.ok(result.users.length > 0, "the work done before the deadline survives");
+  assert.ok(
+    result.users.length < logins.length,
+    `it stopped early rather than draining all 1000 (got ${result.users.length})`,
+  );
+});
+
+test("the batch ladder climbs back up after a run of clean batches", async () => {
+  // The ladder used to be one-way. A five-hour pass took a few transient 502s in
+  // its opening minutes, pinned itself to one alias per query, and stayed there:
+  // 26,783 users in five hours against the 10-alias rate the verify tier had
+  // just measured. Stepping down must be recoverable, or a momentary wobble
+  // costs an order of magnitude for the rest of the run.
+  let calls = 0;
+  let clock = 0;
+  const client = new GitHubClient({
+    token: "t",
+    concurrency: 1,
+    sleepImpl: async (ms) => {
+      clock += ms;
+    },
+    now: () => clock,
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(String((init as RequestInit).body)) as {
+        variables: Record<string, string>;
+      };
+      const aliases = Object.keys(body.variables).filter((k) => k !== "from" && k !== "to");
+      // Only the first request fails, and it fails as a gateway error — the
+      // transient shape, not a real ceiling.
+      if (++calls <= 1) return new Response("gateway", { status: 502 });
+      return Response.json({
+        data: {
+          rateLimit: { cost: 1, limit: 5000, remaining: 4999, resetAt: "", nodeCount: 1 },
+          ...Object.fromEntries(
+            aliases.map((alias) => [
+              alias,
+              {
+                login: body.variables[alias],
+                name: null,
+                avatarUrl: "",
+                location: null,
+                company: null,
+                bio: null,
+                followers: { totalCount: 1 },
+                repositories: { totalCount: 1 },
+                contributionsCollection: {
+                  totalCommitContributions: 1,
+                  totalPullRequestContributions: 0,
+                  totalIssueContributions: 0,
+                  totalPullRequestReviewContributions: 0,
+                  restrictedContributionsCount: 0,
+                  contributionCalendar: { totalContributions: 1 },
+                },
+              },
+            ]),
+          ),
+        },
+      });
+    },
+  });
+
+  const logins = Array.from({ length: 900 }, (_, i) => `dev${i}`);
+  const result = await client.enrichUsers(logins, { from: "a", to: "b" }, { calendar: false });
+
+  assert.equal(result.users.length, 900, "every login is still hydrated");
+  assert.ok(
+    client.batchSize > 1,
+    `the batch recovered rather than staying at the floor (ended at ${client.batchSize})`,
+  );
+});
+
 test("a board entry round-trips back to everything a board can serve", async () => {
   // The resume path rebuilds unprofiled users from the committed board, so this
   // conversion is load-bearing: a field added to LeaderboardEntry and forgotten

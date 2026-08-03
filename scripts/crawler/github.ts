@@ -97,6 +97,18 @@ const GRAPHQL_RESERVE = 200;
 const CONCURRENCY = 6;
 const MAX_CONCURRENCY = 8;
 
+/**
+ * Clean batches at a reduced size before trying the next rung up.
+ *
+ * The ladder used to be one-way: `stepDownFrom` walked 10 -> 1 on timeouts and
+ * only `resetBatchSize` (after a dead-letter) ever went back up. A five-hour run
+ * took a few transient 502s in its first minutes, pinned itself to one alias per
+ * query, and spent the rest of the run at a tenth of the throughput it had just
+ * measured as achievable. Fifty is large enough that a genuinely unservable size
+ * is not retried every other batch, small enough to recover in seconds.
+ */
+const BATCH_RECOVERY_RUN = 50;
+
 const MAX_ATTEMPTS = 5;
 
 /**
@@ -255,6 +267,22 @@ export interface EnrichOptions {
    * run that only writes at the end is not one.
    */
   onBatch?: (batch: EnrichResult & { index: number }) => void | Promise<void>;
+  /**
+   * Wall-clock time (epoch ms) after which no new batch is started.
+   *
+   * This exists because of a specific, expensive failure. A 250,000-login pass
+   * ran for five hours inside a 350-minute job, hydrating 26,783 developers —
+   * and then the runner cancelled the job. `runHydrate` publishes its boards
+   * *after* this method returns, so being killed mid-loop meant every one of
+   * those records died with the runner: the journal that held them lives in a
+   * gitignored directory, and the commit step never ran.
+   *
+   * A crawler that cannot be interrupted safely is not resumable, whatever its
+   * journal does. So the run now stops itself with time to spare, lets its
+   * caller publish, and leaves a committed board for the next run to resume
+   * from. In-flight batches are allowed to finish; only new ones are refused.
+   */
+  deadline?: number;
 }
 
 export interface GitHubApi {
@@ -608,6 +636,9 @@ export class GitHubClient implements GitHubApi {
   searchLimiter: TokenBucket;
   batchSize: number;
   concurrency: number;
+  /** Consecutive successful batches since the last size change — see
+   *  BATCH_RECOVERY_RUN. */
+  private successesAtSize = 0;
 
   constructor(options: ClientOptions) {
     this.token = options.token;
@@ -805,7 +836,14 @@ export class GitHubClient implements GitHubApi {
     const requeued: string[] = [];
     let journal = Promise.resolve();
 
+    // Set when the run must wind down: either the caller's deadline passed, or
+    // the hourly budget ran out with less time left than the reset needs.
+    let stopping = false;
+
+    const outOfTime = () => options.deadline !== undefined && this.now() >= options.deadline;
+
     const takeBatch = (): string[] | null => {
+      if (stopping || outOfTime()) return null;
       if (requeued.length) return requeued.splice(0, this.batchSize);
       if (cursor >= logins.length) return null;
       const batch = logins.slice(cursor, cursor + this.batchSize);
@@ -903,7 +941,14 @@ export class GitHubClient implements GitHubApi {
         }
         batchIndex++;
 
-        await this.adaptBatchSize(rateLimitFrom(body), batch.length);
+        // A false return means "the hourly budget is spent and waiting for the
+        // reset would overrun the deadline". Winding down here is what lets the
+        // caller publish what has been collected; sleeping instead is how the
+        // last run spent its final 29 minutes idle and then lost everything.
+        if (!(await this.adaptBatchSize(rateLimitFrom(body), batch.length, options.deadline))) {
+          stopping = true;
+          return;
+        }
       }
     };
 
@@ -929,6 +974,7 @@ export class GitHubClient implements GitHubApi {
    */
   private resetBatchSize(): void {
     this.batchSize = GRAPHQL_BATCH_START;
+    this.successesAtSize = 0;
   }
 
   /**
@@ -946,6 +992,7 @@ export class GitHubClient implements GitHubApi {
     const next = GRAPHQL_BATCH_LADDER.find((size) => size < this.batchSize);
     if (next === undefined) return false;
     this.batchSize = next;
+    this.successesAtSize = 0;
     this.log(`GraphQL could not serve ${sentAt} aliases; batch now ${next}`);
     return true;
   }
@@ -955,8 +1002,12 @@ export class GitHubClient implements GitHubApi {
    * measurement set the batch size so a heavier-than-expected selection shrinks
    * batches instead of exhausting the hourly budget halfway through a tier.
    */
-  private async adaptBatchSize(limit: RateLimitInfo | null, batchSize: number): Promise<void> {
-    if (!limit) return;
+  private async adaptBatchSize(
+    limit: RateLimitInfo | null,
+    batchSize: number,
+    deadline?: number,
+  ): Promise<boolean> {
+    if (!limit) return true;
 
     // Cost is per query, not per login. One point for a hundred logins is the
     // expected shape; if the API bills more, shrink so a single request never
@@ -974,11 +1025,37 @@ export class GitHubClient implements GitHubApi {
       this.log(`node count ${limit.nodeCount} near the 500k cap; batch now ${this.batchSize}`);
     }
 
-    if (limit.remaining > GRAPHQL_RESERVE) return;
+    // Successful batches at a reduced size are evidence the reduction was for a
+    // transient failure rather than a real ceiling. Without this the ladder is a
+    // one-way ratchet: a handful of 502s early in a five-hour pass pinned the
+    // batch to 1 for the rest of it, turning 50,000 users an hour into 5,000.
+    if (this.batchSize < GRAPHQL_BATCH_START && ++this.successesAtSize >= BATCH_RECOVERY_RUN) {
+      const next = [...GRAPHQL_BATCH_LADDER].reverse().find((size) => size > this.batchSize);
+      if (next !== undefined) {
+        this.batchSize = Math.min(next, GRAPHQL_BATCH_MAX);
+        this.successesAtSize = 0;
+        this.log(`${BATCH_RECOVERY_RUN} clean batches; trying ${this.batchSize} aliases again`);
+      }
+    }
 
-    const waitMs = Math.max(0, Date.parse(limit.resetAt) - Date.now()) + 1000;
+    if (limit.remaining > GRAPHQL_RESERVE) return true;
+
+    const waitMs = Math.max(0, Date.parse(limit.resetAt) - this.now()) + 1000;
+
+    // Waiting past the deadline buys nothing: the caller would be killed before
+    // it could use the refreshed budget, and everything collected so far would
+    // go with it. Stop instead, and let the caller publish.
+    if (deadline !== undefined && this.now() + waitMs > deadline) {
+      this.log(
+        `GraphQL budget down to ${limit.remaining}; the ${Math.ceil(waitMs / 60_000)}min reset ` +
+          "runs past this run's deadline, so stopping here to publish what is collected",
+      );
+      return false;
+    }
+
     this.log(`GraphQL budget down to ${limit.remaining}; waiting ${Math.ceil(waitMs / 1000)}s`);
     await this.sleep(waitMs);
+    return true;
   }
 
   private async request(

@@ -172,7 +172,14 @@ jobs:
         env:
           GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
         run: pnpm crawl --tier=hydrate ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      # `if: always()` because a job cancelled by `timeout-minutes` skips every
+      # remaining step, and that is how run 30767109823 threw away five hours of
+      # hydration: 26,783 developers collected, nothing committed. The crawler
+      # now stops itself before the timeout so this runs on the normal path, but
+      # a run killed for any other reason should still keep what it wrote.
+      # commit-data.sh no-ops when there is nothing staged, so this is safe.
       - name: Commit
+        if: always()
         run: .github/scripts/commit-data.sh hydrate
 
   # The expensive selection, bought only for the depth that has a profile page.
@@ -204,7 +211,14 @@ jobs:
         env:
           GH_CRAWL_TOKEN: ${{ secrets.GH_CRAWL_TOKEN }}
         run: pnpm crawl --tier=calendars ${{ inputs.limit && format('--limit={0}', inputs.limit) || '' }}
+      # `if: always()` because a job cancelled by `timeout-minutes` skips every
+      # remaining step, and that is how run 30767109823 threw away five hours of
+      # hydration: 26,783 developers collected, nothing committed. The crawler
+      # now stops itself before the timeout so this runs on the normal path, but
+      # a run killed for any other reason should still keep what it wrote.
+      # commit-data.sh no-ops when there is nothing staged, so this is safe.
       - name: Commit
+        if: always()
         run: .github/scripts/commit-data.sh calendars
 
   # The supplementary search pass. GH Archive only records *public* activity, so

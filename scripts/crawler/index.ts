@@ -165,6 +165,32 @@ const PROBE_LOGINS = [
   "tpope",
 ];
 
+/**
+ * When a hydration pass must stop collecting and start publishing.
+ *
+ * A GitHub Actions job dies when its `timeout-minutes` expires, and dying is
+ * total: the runner cancels the job, every later step is skipped, and the
+ * workspace goes away. A run that collects for the whole job and publishes at
+ * the end therefore publishes nothing.
+ *
+ * That is not hypothetical. Run 30767109823 hydrated 26,783 developers over
+ * five hours, was cancelled at the 350-minute mark, and committed none of them:
+ * `publishHydrated` had not been reached, and the journal holding the records
+ * lives under the gitignored `data/discovery/`. Five hours of free-tier budget
+ * for nothing.
+ *
+ * So the crawl stops itself with room to spare. `CRAWL_BUDGET_MINUTES` keeps the
+ * number next to the workflow's `timeout-minutes` rather than buried here; the
+ * default leaves 50 minutes, which is far more than publishing needs and cheap
+ * insurance against a slow finish.
+ */
+const HYDRATE_BUDGET_MINUTES = Number(process.env.CRAWL_BUDGET_MINUTES ?? 300);
+const startedAtMs = Date.now();
+
+function hydrationDeadline(): number {
+  return startedAtMs + HYDRATE_BUDGET_MINUTES * 60_000;
+}
+
 /** Rows per board file once a board outgrows a single reviewable JSON file. */
 const BOARD_SHARD_SIZE = 25_000;
 const MIN_USERS_FOR_CITY = 8;
@@ -1131,6 +1157,7 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
   let ranked = done.size;
 
   await context.api.enrichUsers(remaining, window, {
+    deadline: hydrationDeadline(),
     calendar: false,
     // The heavy sorted connection. Off here and on for the calendars pass —
     // leaving it on is what made this query unservable at any batch size.
@@ -1160,6 +1187,14 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
   // Read back what was written, including anything an earlier interrupted run
   // contributed. Flagged accounts are separated here rather than at write time
   // so a resumed run classifies the whole set by one rule.
+  if (Date.now() >= hydrationDeadline()) {
+    console.log(
+      `\nStopped at the ${HYDRATE_BUDGET_MINUTES}-minute budget with ` +
+        `${(remaining.length - (ranked - done.size)).toLocaleString()} logins still to hydrate. ` +
+        "Publishing what is collected so the next scheduled run resumes from it.",
+    );
+  }
+
   const all = await journal.readAll();
   const users = all.filter((user) => !user.flagged);
   flagged.push(...all.filter((user) => user.flagged));
