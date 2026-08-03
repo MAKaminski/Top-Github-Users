@@ -795,6 +795,67 @@ test("the batch ladder climbs back up after a run of clean batches", async () =>
   );
 });
 
+test("a nearly-empty crawl leaves yesterday's corpus standing", async (t) => {
+  // The worst thing this crawler can do, and it did it: on 2026-08-03 a run
+  // collected nine developers before GitHub stopped serving, published them,
+  // and replaced a 6,551-developer board. The site served nine people until the
+  // commit was reverted. Losing a crawl is cheap; losing the corpus is not.
+  //
+  // Two independent defences, and this exercises the first: the corpus is
+  // carried forward from the committed board regardless of snapshot date, so a
+  // run that collects almost nothing republishes almost everything. The second
+  // is the MIN_RETAINED_FRACTION guard in publishHydrated, which refuses the
+  // write outright if the count ever does collapse.
+  const dir = await mkdtemp(path.join(tmpdir(), "shrink-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  const date = new Date().toISOString().slice(0, 10);
+  const { writeJson } = await import("../lib/io.ts");
+
+  const entries = Array.from({ length: 200 }, (_, i) => ({
+    rank: i + 1,
+    login: `resident${i}`,
+    name: null,
+    avatarUrl: "",
+    location: null,
+    company: null,
+    followers: 1,
+    total: 100_000 - i,
+    public: 100_000 - i,
+    private: 0,
+    countryId: null,
+    cityId: null,
+    previousRank: null,
+    hasProfile: false,
+  }));
+  await writeJson(path.join(dir, "leaderboard", "worldwide.json"), {
+    scope: "worldwide",
+    name: "Worldwide",
+    generatedAt: "2026-08-02",
+    entries,
+  });
+
+  // Only the logins the fixture can serve, so the run collects a handful — the
+  // shape of a rate-limited or interrupted crawl.
+  await aimAtGermany(dir, date);
+  await seedCandidates(dir, date, ["octoflow"]);
+
+  await run(parseOptions(["--fixtures", "--tier=hydrate"]), dir);
+
+  const after = JSON.parse(
+    await readFile(path.join(dir, "leaderboard", "worldwide.json"), "utf8"),
+  ) as { entries: { login: string }[]; generatedAt: string };
+
+  // Everyone who was there is still there, plus whatever this run managed.
+  assert.ok(
+    after.entries.length >= 200,
+    `the corpus survived a one-user crawl (${after.entries.length} entries)`,
+  );
+  assert.ok(after.entries.some((entry) => entry.login === "resident0"));
+  assert.ok(after.entries.some((entry) => entry.login === "octoflow"));
+  assert.equal(after.generatedAt, date, "published under today's date");
+});
+
 test("a board entry round-trips back to everything a board can serve", async () => {
   // The resume path rebuilds unprofiled users from the committed board, so this
   // conversion is load-bearing: a field added to LeaderboardEntry and forgotten

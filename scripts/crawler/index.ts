@@ -969,8 +969,20 @@ class HydrationJournal {
  * only on a profile page, which by definition these logins do not have. They
  * come back on the next unresumed pass.
  *
- * Returns nothing at all when the committed board is from an earlier snapshot:
- * a new day is a new measurement, not a resume.
+ * Carried forward across snapshot dates, deliberately.
+ *
+ * An earlier version returned nothing unless the committed board matched
+ * today's date — "a new day is a new measurement, not a resume". That reasoning
+ * is right for a corpus that can be collected inside one day and catastrophic
+ * for one that cannot. At midnight UTC the restore went silent, the journal
+ * started empty, and a run that managed nine users published a nine-user board
+ * over a 6,551-user one. That happened, on 2026-08-03.
+ *
+ * So the corpus is cumulative. A developer stays in the board with their last
+ * measurement until a later run re-hydrates them; the trailing twelve-month
+ * window moves by a day at a time, so a day-old measurement is not a stale one.
+ * `generatedAt` is the publication date, and /methodology says which parts of a
+ * snapshot were refreshed in it.
  */
 async function restoreHydrated(context: Context): Promise<RankedUser[]> {
   const restored: RankedUser[] = [];
@@ -981,7 +993,6 @@ async function restoreHydrated(context: Context): Promise<RankedUser[]> {
       path.join(context.dataDir, "leaderboard", file),
     );
     if (!board?.entries?.length) break;
-    if (board.generatedAt !== context.date) return [];
 
     for (const entry of board.entries) {
       const profile = entry.hasProfile
@@ -1234,7 +1245,50 @@ async function runHydrate(context: Context, flagged: RankedUser[]): Promise<void
  * Grouping one hydrated set on its parsed location costs nothing extra and has
  * no ceiling.
  */
+/**
+ * How much of the existing corpus a new snapshot must retain to be publishable.
+ *
+ * This is a guard against exactly one thing, and it is the worst thing this
+ * crawler can do: replace a good board with a much smaller one. On 2026-08-03 a
+ * run collected nine developers before GitHub stopped serving, published them,
+ * and overwrote a 6,551-developer board. The site served nine people until the
+ * commit was reverted.
+ *
+ * A crawl is *supposed* to grow the corpus or leave it roughly as it found it.
+ * A large drop means something went wrong upstream — an outage, a bad candidate
+ * file, a restore that did not restore — and the right response is to fail
+ * loudly with the previous snapshot intact, not to publish the wreckage.
+ *
+ * `CRAWL_ALLOW_SHRINK=1` overrides it, for the one legitimate case: deliberately
+ * rebuilding a smaller corpus after lowering WORLDWIDE_SIZE.
+ */
+const MIN_RETAINED_FRACTION = 0.9;
+
+/** Rows in the committed worldwide board, across every shard. */
+async function committedWorldwideCount(dataDir: string): Promise<number> {
+  let total = 0;
+  for (let part = 1; ; part++) {
+    const file = part === 1 ? "worldwide.json" : `worldwide.${part}.json`;
+    const board = await readJsonFile<Leaderboard>(path.join(dataDir, "leaderboard", file));
+    if (!board?.entries?.length) break;
+    total += board.entries.length;
+  }
+  return total;
+}
+
 async function publishHydrated(context: Context, users: RankedUser[]): Promise<void> {
+  const existing = await committedWorldwideCount(context.dataDir);
+  if (users.length < existing * MIN_RETAINED_FRACTION && process.env.CRAWL_ALLOW_SHRINK !== "1") {
+    throw new Error(
+      `Refusing to publish: this run has ${users.length.toLocaleString()} developers but the ` +
+        `committed board holds ${existing.toLocaleString()}. Publishing would destroy ` +
+        `${(existing - users.length).toLocaleString()} of them.\n` +
+        "This is what an interrupted or rate-limited crawl looks like — the previous snapshot " +
+        "is left untouched and the next run resumes from it. If the corpus is genuinely meant " +
+        "to shrink (WORLDWIDE_SIZE was lowered), re-run with CRAWL_ALLOW_SHRINK=1.",
+    );
+  }
+
   const worldwide = assignRanks(users, "worldwide").slice(0, WORLDWIDE_SIZE);
 
   // Registered now, written at the very end.
