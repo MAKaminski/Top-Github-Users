@@ -3,10 +3,6 @@
     "commitgraph": {
       "type": "http",
       "url": "${COMMITGRAPH_MCP_URL:-https://top-github-users-amber.vercel.app/api/mcp}"
-    },
-    "rejouice-patterns": {
-      "type": "http",
-      "url": "https://rejouice-patterns.vercel.app/api/mcp"
     }
   }
 }

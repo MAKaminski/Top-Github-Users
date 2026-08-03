@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "commitgraph",
+  "displayName": "Commitgraph",
+  "version": "1.0.0",
+  "description": "Rankings of the most active developers on GitHub — worldwide, and by country and city — with contribution calendars, streaks, employers and distributions. Read-only over a committed public snapshot.",
+  "author": {
+    "name": "Michael Kaminski",
+    "url": "https://github.com/MAKaminski"
+  },
+  "homepage": "https://top-github-users-amber.vercel.app/connect",
+  "repository": "https://github.com/MAKaminski/Top-Github-Users",
+  "keywords": ["github", "developers", "leaderboard", "rankings", "open-source", "mcp"]
+}

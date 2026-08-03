@@ -1,69 +1,25 @@
 import { CAVEATS } from "@/lib/api/caveats";
 import { baseUrlFrom, handle, json } from "@/lib/api/http";
 import { getManifest } from "@/lib/api/queries";
+import { PROMPTS } from "@/lib/mcp/prompts";
+import { TOOLS } from "@/lib/mcp/tools";
+import { PROTOCOL_VERSION, SUPPORTED_PROTOCOLS } from "@/lib/mcp/protocol";
+import { INSTALL_COMMANDS, MARKETPLACE_NAME, PLUGIN_NAME, REPO_SLUG } from "@/lib/site";
 
 /**
  * Discovery document for the MCP server.
  *
- * A client that knows only the domain can find the endpoint, the transport and
- * the tool list from here without a human pasting a URL. Everything is derived
- * from the incoming request, so the same code is correct on localhost and on the
- * deployed domain — a hardcoded origin is the usual way this file goes stale.
+ * A client that knows only the domain can find the endpoint, the transport, the
+ * tool list and the install path from here without a human pasting a URL.
+ *
+ * Two rules hold this file together. The origin is derived from the incoming
+ * request, so the same code is correct on localhost and on the deployed domain
+ * — a hardcoded origin is the usual way this file goes stale. And the tool and
+ * prompt lists are read from the server's own registries rather than retyped:
+ * this document previously carried a hand-maintained copy that had fallen two
+ * tools behind what the server actually served, which is worse than not
+ * advertising them at all, because a client trusts what it finds here.
  */
-
-const TOOLS: { name: string; description: string }[] = [
-  {
-    name: "commitgraph_get_integration_guide",
-    description:
-      "Start here. How the dataset is built, what each tool answers, and the caveats that apply " +
-      "to every number returned.",
-  },
-  {
-    name: "commitgraph_describe_dataset",
-    description: "Snapshot date, coverage counts and totals, and where the data came from.",
-  },
-  {
-    name: "commitgraph_list_places",
-    description:
-      "Countries and cities with user counts and contribution totals. Use it to find the ids " +
-      "the other tools take.",
-  },
-  {
-    name: "commitgraph_get_leaderboard",
-    description: "Ranked developers for worldwide, a country or a city.",
-  },
-  {
-    name: "commitgraph_search_developers",
-    description:
-      "Filter every ranked developer by location, company, contributions, followers or free text.",
-  },
-  {
-    name: "commitgraph_get_developer",
-    description:
-      "One developer: profile, ranks and contribution calendar. Says so explicitly when a login " +
-      "is ranked but has no stored profile record.",
-  },
-  {
-    name: "commitgraph_compare_developers",
-    description: "Several developers side by side, with the same coverage honesty as get_developer.",
-  },
-  {
-    name: "commitgraph_get_organizations",
-    description: "Employers ranked by the combined contributions of tracked developers.",
-  },
-  {
-    name: "commitgraph_get_rank_history",
-    description:
-      "Rank movement across snapshots. Reports that a series is not plottable rather than " +
-      "inventing a trend from one crawl.",
-  },
-  {
-    name: "commitgraph_get_statistics",
-    description:
-      "Dataset-wide aggregates: public/private split, follower-versus-contribution correlation, " +
-      "contribution percentiles, per-region totals.",
-  },
-];
 
 export function GET(request: Request): Promise<Response> {
   return handle(async () => {
@@ -85,7 +41,7 @@ export function GET(request: Request): Promise<Response> {
           transport: "streamable-http",
           method: "POST",
           protocol: "jsonrpc-2.0",
-          protocolVersion: "2025-06-18",
+          protocolVersion: PROTOCOL_VERSION,
           authentication: { type: "none" },
         },
       ],
@@ -93,13 +49,55 @@ export function GET(request: Request): Promise<Response> {
       // server entry and some read neither — one endpoint, stated twice.
       endpoint: `${base}/api/mcp`,
       transport: "streamable-http",
-      protocolVersion: "2025-06-18",
-      tools: TOOLS,
+      protocolVersion: PROTOCOL_VERSION,
+      supportedProtocolVersions: SUPPORTED_PROTOCOLS,
+      capabilities: { tools: true, resources: true, prompts: true },
+
+      /**
+       * How a human adds this server, per client. Written out because the most
+       * common reason a working MCP server goes unused is that nobody knows the
+       * URL — an endpoint is only half an answer without the gesture that
+       * consumes it.
+       */
+      install: {
+        page: `${base}/connect`,
+        claudeConnector: {
+          // Claude's hosted surfaces take a URL and nothing else: the server is
+          // public, so there is no OAuth step and no credential to configure.
+          client: "Claude (web, desktop, mobile)",
+          via: "Settings → Connectors → Add custom connector",
+          url: `${base}/api/mcp`,
+          authentication: "none",
+        },
+        claudeCode: { client: "Claude Code", command: INSTALL_COMMANDS.claudeCode },
+        claudeCodePlugin: {
+          client: "Claude Code",
+          marketplace: REPO_SLUG,
+          plugin: `${PLUGIN_NAME}@${MARKETPLACE_NAME}`,
+          commands: [INSTALL_COMMANDS.marketplaceAdd, INSTALL_COMMANDS.pluginInstall],
+        },
+        mcpJson: {
+          mcpServers: {
+            commitgraph: { type: "http", url: `${base}/api/mcp` },
+          },
+        },
+      },
+
+      tools: TOOLS.map((tool) => ({ name: tool.name, description: tool.description })),
+      prompts: PROMPTS.map((prompt) => ({
+        name: prompt.name,
+        title: prompt.title,
+        description: prompt.description,
+        arguments: prompt.arguments,
+      })),
+
       links: {
         restIndex: `${base}/api/v1`,
         openapi: `${base}/api/openapi.json`,
         llmsTxt: `${base}/llms.txt`,
         methodology: `${base}/methodology`,
+        connect: `${base}/connect`,
+        repository: `https://github.com/${REPO_SLUG}`,
         website: base,
       },
       caveats: CAVEATS,

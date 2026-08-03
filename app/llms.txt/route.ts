@@ -2,6 +2,9 @@ import { CAVEATS } from "@/lib/api/caveats";
 import { CORS_HEADERS, baseUrlFrom, handle } from "@/lib/api/http";
 import { getManifest } from "@/lib/api/queries";
 import { loadSearchIndex } from "@/lib/api/search-index";
+import { PROMPTS } from "@/lib/mcp/prompts";
+import { PROTOCOL_VERSION } from "@/lib/mcp/protocol";
+import { TOOLS } from "@/lib/mcp/tools";
 
 /**
  * /llms.txt — the plain-text brief for a model that lands on this domain.
@@ -21,6 +24,23 @@ export function GET(request: Request): Promise<Response> {
     // would otherwise wrap them wherever the source happens to break, which puts
     // newlines mid-sentence once the numbers change length.
     const count = (value: number) => value.toLocaleString("en-US");
+
+    /** Names are read from the server's own registries rather than retyped, so
+     *  this file cannot fall behind the tools it advertises. Wrapped by hand
+     *  because the surrounding document is plain text with a hanging indent,
+     *  and a single 400-column line reads badly in a terminal. */
+    const wrapList = (names: string[], width = 92): string => {
+      const lines: string[] = [];
+      for (const name of names) {
+        const last = lines[lines.length - 1];
+        if (last !== undefined && `${last}, ${name}`.length <= width) {
+          lines[lines.length - 1] = `${last}, ${name}`;
+        } else {
+          lines.push(name);
+        }
+      }
+      return lines.join(",\n  ");
+    };
 
     const intro = [
       `Commitgraph ranks ${count(manifest.counts.users)} developers across`,
@@ -51,14 +71,16 @@ ${intro}
 ## Model Context Protocol
 
 - Endpoint: ${base}/api/mcp
-- Method: POST, JSON-RPC 2.0, protocol version 2025-06-18, no authentication
+- Method: POST, JSON-RPC 2.0, protocol version ${PROTOCOL_VERSION}, no authentication
 - Discovery: ${base}/.well-known/mcp.json
-- Tools: commitgraph_get_integration_guide, commitgraph_describe_dataset, commitgraph_list_places,
-  commitgraph_get_leaderboard, commitgraph_search_developers, commitgraph_get_developer,
-  commitgraph_compare_developers, commitgraph_get_organizations, commitgraph_get_rank_history,
-  commitgraph_get_statistics
+- Install instructions for every client: ${base}/connect
+- Tools: ${wrapList(TOOLS.map((tool) => tool.name))}
+- Prompts: ${wrapList(PROMPTS.map((prompt) => prompt.name))}
 
 Call commitgraph_get_integration_guide first; it explains the dataset before you query it.
+
+In Claude, add ${base}/api/mcp under Settings → Connectors, or run
+\`claude mcp add --transport http commitgraph ${base}/api/mcp\` in Claude Code.
 
 ## REST
 
@@ -95,6 +117,7 @@ ${excluded}
 - ${base}/countries and ${base}/cities — place indexes
 - ${base}/u/{login} — a developer's profile
 - ${base}/methodology — how the numbers are made, and where they are wrong
+- ${base}/connect — how to add this server to Claude and other MCP clients
 `;
 
     return new Response(body, {

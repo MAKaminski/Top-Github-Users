@@ -28,6 +28,7 @@ const ROUTES = [
   ["repos", "/repos"],
   ["profile", "/u/felixonmars"],
   ["methodology", "/methodology"],
+  ["connect", "/connect"],
 ];
 
 const failures = [];
