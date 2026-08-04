@@ -44,20 +44,39 @@ export function SiteFooter({
           */}
           {PRODUCT_HUNT ? (
             <a
-              href={`https://www.producthunt.com/posts/${PRODUCT_HUNT.slug}?embed=true&utm_source=badge-featured&utm_medium=badge`}
+              href={`${PRODUCT_HUNT.url}?utm_source=badge-featured&utm_medium=badge`}
               target="_blank"
               rel="noopener noreferrer"
               className="mt-[var(--space-2xs)] inline-block"
             >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={`https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=${PRODUCT_HUNT.postId}&theme=neutral`}
-                alt="Commitgraph on Product Hunt"
-                width={250}
-                height={54}
-                loading="lazy"
-                decoding="async"
-              />
+              {PRODUCT_HUNT.postId ? (
+                /* eslint-disable-next-line @next/next/no-img-element */
+                <img
+                  src={`https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=${PRODUCT_HUNT.postId}&theme=neutral`}
+                  alt="Commitgraph on Product Hunt"
+                  width={250}
+                  height={54}
+                  loading="lazy"
+                  decoding="async"
+                />
+              ) : (
+                /* Stand-in until the post id is known. Sized and shaped like the
+                   real badge so swapping it in does not move the footer, and
+                   drawn from our own tokens rather than imitating Product
+                   Hunt's mark — a hand-made lookalike of somebody else's badge
+                   is worse than an honest link. */
+                <span className="flex h-[54px] w-[250px] items-center gap-[var(--space-xs)] border border-rule px-[var(--space-sm)] transition-colors hover:border-accent">
+                  <span aria-hidden className="text-accent-warm">
+                    ▲
+                  </span>
+                  <span className="flex flex-col">
+                    <span className="mono text-caption uppercase tracking-[var(--tracking-caption)] text-muted">
+                      Find us on
+                    </span>
+                    <span className="text-caption">Product Hunt</span>
+                  </span>
+                </span>
+              )}
             </a>
           ) : null}
         </div>

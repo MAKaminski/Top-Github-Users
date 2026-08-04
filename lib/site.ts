@@ -68,19 +68,24 @@ export const DEMO_CLIP = {
 /**
  * Product Hunt listing, or null before launch.
  *
- * `postId` is the numeric id the official badge endpoint takes — not the slug.
- * Find it in the embed snippet on the launch page: the badge `<img>` src ends
- * in `?post_id=<id>`. Both are needed: the id renders the badge, the slug is
- * the human link.
+ * Two independent pieces, because they became available at different times.
  *
- * Null until launch for the same reason DEMO_VIDEO is: a badge pointing at a
- * post that does not exist yet renders Product Hunt's own error art in the
- * footer of every page on the site.
+ * `url` is the public listing and is all the footer needs to render a link.
+ *
+ * `postId` is the numeric id Product Hunt's badge endpoint takes — not the
+ * slug, and not discoverable from the public page; it appears only in the embed
+ * snippet on the launch dashboard, as `featured.svg?post_id=<id>`. While it is
+ * null the footer renders a plain link instead of the badge, which is the right
+ * failure: `post_id=undefined` returns Product Hunt's error art, and that would
+ * sit in the footer of all 2,745 pages.
  */
 export const PRODUCT_HUNT: {
-  postId: string;
-  slug: string;
-} | null = null;
+  url: string;
+  postId: string | null;
+} | null = {
+  url: "https://www.producthunt.com/products/commitgraph",
+  postId: null,
+};
 
 /** Named once so the /connect page, the discovery document and the README
  *  cannot drift from each other. */

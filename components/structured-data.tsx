@@ -1,4 +1,4 @@
-import { MCP_URL, REPO_URL, SITE_URL } from "@/lib/site";
+import { MCP_URL, PRODUCT_HUNT, REPO_URL, SITE_URL } from "@/lib/site";
 import type { Manifest } from "@/lib/types";
 
 /**
@@ -31,6 +31,13 @@ export function StructuredData({ manifest }: { manifest: Manifest }) {
         "Leaderboards of the most active developers on GitHub — worldwide, and by country and city.",
       inLanguage: "en",
       publisher: { "@id": `${SITE_URL}/#person` },
+      /**
+       * The profiles that identify this same project elsewhere. This is the
+       * half of a Product Hunt listing that search engines and assistants act
+       * on: it ties the listing and the repository to this domain as one
+       * entity, rather than three unrelated pages that happen to share a name.
+       */
+      sameAs: [REPO_URL, ...(PRODUCT_HUNT ? [PRODUCT_HUNT.url] : [])],
     },
     {
       "@type": "Person",

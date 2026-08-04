@@ -146,12 +146,19 @@ test("the self-hosted demo clip and its poster are actually committed", () => {
   }
 });
 
-test("the Product Hunt badge is either absent or fully configured", () => {
-  // Both fields or neither. The badge endpoint takes the numeric post_id, and
-  // the human link takes the slug — shipping one without the other renders
-  // Product Hunt's error art in the footer of every page.
+test("the Product Hunt link is either absent or usable", () => {
   if (PRODUCT_HUNT === null) return;
 
-  assert.match(PRODUCT_HUNT.postId, /^\d+$/, "post_id is the numeric id, not the slug");
-  assert.match(PRODUCT_HUNT.slug, /^[a-z0-9-]+$/, "slug is the kebab-case URL segment");
+  assert.match(
+    PRODUCT_HUNT.url,
+    /^https:\/\/www\.producthunt\.com\/(products|posts|p)\/[a-z0-9-]+$/,
+    "expected a canonical Product Hunt listing URL with no query string",
+  );
+
+  // Optional, but when present it must be the numeric id the badge endpoint
+  // takes. A slug here renders Product Hunt's error art site-wide, because the
+  // footer is on every page.
+  if (PRODUCT_HUNT.postId !== null) {
+    assert.match(PRODUCT_HUNT.postId, /^\d+$/, "post_id is the numeric id, not the slug");
+  }
 });
