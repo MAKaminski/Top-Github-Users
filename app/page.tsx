@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { MaskedLineReveal } from "@/components/patterns/masked-line-reveal";
 import { OdometerStat } from "@/components/patterns/odometer-stat";
@@ -7,6 +8,10 @@ import { FollowersScatter } from "@/components/charts/scatter";
 import { TileGridMap } from "@/components/charts/tile-grid-map";
 import { getManifest, getWorldwide } from "@/lib/data";
 import { abbreviate, exact } from "@/lib/format";
+
+export const metadata: Metadata = {
+  alternates: { canonical: "/" },
+};
 
 export default async function HomePage() {
   const [manifest, worldwide] = await Promise.all([getManifest(), getWorldwide()]);

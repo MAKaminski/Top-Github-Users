@@ -11,6 +11,7 @@ import {
 } from "./protocol";
 import { TOOLS, TOOLS_BY_NAME } from "./tools";
 import { RESOURCES, RESOURCES_BY_URI } from "./resources";
+import { PROMPTS_BY_NAME, promptDescriptors } from "./prompts";
 
 const SERVER_INFO = {
   name: "commitgraph-mcp-server",
@@ -20,7 +21,7 @@ const SERVER_INFO = {
 
 const INSTRUCTIONS = `Rankings of the most active developers on GitHub — worldwide, and by country and city — with contribution calendars, streaks and distributions.
 
-Start with commitgraph_describe_dataset: one call returns the snapshot date, every count, the meaning and provenance of every field, and the complete list of valid scope ids. Then use commitgraph_search_developers to find people and commitgraph_get_developer to pull one in full.
+Start with commitgraph_describe_dataset: one call returns the snapshot date, every count, the meaning and provenance of every field, and the complete list of valid scope ids. Then use commitgraph_search_developers to find people and commitgraph_get_developer to pull one in full. The prompts on this server are the ready-made versions of those sequences — call prompts/list before assembling one by hand.
 
 Two things to carry into any answer you build from this data. Contribution totals are measured, but where a day-by-day calendar has not been crawled its shape is a deterministic estimate derived from that total — every record reports which. And GitHub location is free text, so country and city are self-reported rather than verified.
 
@@ -29,11 +30,32 @@ This server is public and read-only over one committed snapshot. It has no acces
 /** Tool arguments arrive untyped; zod both validates them and is the source the
  *  advertised inputSchema is generated from, so the two can never disagree. */
 function toolDescriptors() {
-  return TOOLS.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: z.toJSONSchema(tool.schema, { io: "input" }),
-  }));
+  return TOOLS.map((tool) => {
+    const readOnly = tool.readOnly ?? true;
+    return {
+      name: tool.name,
+      title: tool.title,
+      description: tool.description,
+      inputSchema: z.toJSONSchema(tool.schema, { io: "input" }),
+      /**
+       * Behavioural hints. `readOnlyHint` is what lets a client run a tool
+       * without confirming every call, and every tool here qualifies: the
+       * server reads one committed snapshot and has no write path.
+       *
+       * `openWorldHint: false` is the honest answer for a closed corpus — this
+       * server does not reach out to GitHub, or anywhere else, at request time.
+       * A client that assumes otherwise would be right to treat the results as
+       * live, and they are not.
+       */
+      annotations: {
+        title: tool.title,
+        readOnlyHint: readOnly,
+        destructiveHint: !readOnly,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    };
+  });
 }
 
 export async function handleRpc(request: JsonRpcRequest): Promise<unknown | null> {
@@ -50,6 +72,7 @@ export async function handleRpc(request: JsonRpcRequest): Promise<unknown | null
         capabilities: {
           tools: { listChanged: false },
           resources: { listChanged: false, subscribe: false },
+          prompts: { listChanged: false },
         },
         serverInfo: SERVER_INFO,
         instructions: INSTRUCTIONS,
@@ -147,7 +170,47 @@ export async function handleRpc(request: JsonRpcRequest): Promise<unknown | null
     }
 
     case "prompts/list":
-      return rpcResult(id, { prompts: [] });
+      return rpcResult(id, { prompts: promptDescriptors() });
+
+    case "prompts/get": {
+      const get = z
+        .object({ name: z.string(), arguments: z.record(z.string(), z.string()).optional() })
+        .safeParse(params);
+      if (!get.success) {
+        return rpcError(id, RpcError.invalidParams, "prompts/get needs a name and arguments.");
+      }
+
+      const prompt = PROMPTS_BY_NAME.get(get.data.name);
+      if (!prompt) {
+        return rpcError(
+          id,
+          RpcError.notFound,
+          `Unknown prompt "${get.data.name}". Call prompts/list for the available prompts.`,
+        );
+      }
+
+      const args = prompt.schema.safeParse(get.data.arguments ?? {});
+      if (!args.success) {
+        return rpcError(
+          id,
+          RpcError.invalidParams,
+          `Invalid arguments for ${prompt.name}. ${z.prettifyError(args.error)}`,
+        );
+      }
+
+      return rpcResult(id, {
+        description: prompt.description,
+        messages: [
+          {
+            role: "user",
+            content: {
+              type: "text",
+              text: prompt.build(args.data as Record<string, string | undefined>),
+            },
+          },
+        ],
+      });
+    }
 
     default:
       return rpcError(id, RpcError.methodNotFound, `Unknown method "${method}".`);

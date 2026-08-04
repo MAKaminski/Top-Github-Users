@@ -23,6 +23,7 @@ export async function generateMetadata({
   const place = manifest.cities.find((p) => p.id === id);
   if (!place) return {};
   return {
+    alternates: { canonical: `/cities/${id}` },
     title: `${place.name} leaderboard`,
     description: `The most active GitHub developers in ${place.name}.`,
   };

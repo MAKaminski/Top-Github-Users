@@ -27,6 +27,7 @@ export async function generateMetadata({
   const user = await getUser(login);
   if (!user) return {};
   return {
+    alternates: { canonical: `/u/${user.login}` },
     title: `${user.name ?? user.login}`,
     description: `${user.login} made ${exact(user.contributions.total)} contributions in the last twelve months.`,
   };

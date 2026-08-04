@@ -5,6 +5,7 @@ import { getOrganizations } from "@/lib/data";
 import { abbreviate, rankLabel } from "@/lib/format";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/orgs" },
   title: "Organizations",
   description:
     "Organizations ranked by the aggregate contributions of the developers who list them.",

@@ -7,6 +7,7 @@ import { flagOf } from "@/scripts-shared/flags";
 import { abbreviate, exact, rankLabel } from "@/lib/format";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/countries" },
   title: "Countries",
   description: "GitHub contribution leaderboards for every tracked country.",
 };

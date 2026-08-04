@@ -5,6 +5,7 @@ import { getFlaggedAccounts, getManifest } from "@/lib/data";
 import { abbreviate, exact } from "@/lib/format";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/methodology" },
   title: "Methodology",
   description: "How Commitgraph's numbers are produced, and where they are wrong.",
 };

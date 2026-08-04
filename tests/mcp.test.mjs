@@ -169,20 +169,145 @@ test("discovery documents agree with what the server actually serves", async () 
   const discovery = await wellKnown.json();
 
   const { body } = await rpc("tools/list");
-  const live = new Set(body.result.tools.map((t) => t.name));
+  const live = body.result.tools.map((t) => t.name).sort();
 
-  const advertised = JSON.stringify(discovery);
-  for (const name of ["commitgraph_describe_dataset", "commitgraph_get_developer"]) {
-    assert.ok(live.has(name), `${name} must exist on the server`);
-    assert.ok(advertised.includes(name), `${name} must appear in the discovery document`);
-  }
+  // The full set, not a spot check. The discovery document once carried a
+  // hand-maintained tool list that had fallen two tools behind the server, and
+  // a subset assertion is exactly what let that through.
+  assert.deepEqual(
+    discovery.tools.map((t) => t.name).sort(),
+    live,
+    "the discovery document must advertise precisely the tools the server serves",
+  );
+
+  const { body: promptList } = await rpc("prompts/list");
+  assert.deepEqual(
+    discovery.prompts.map((p) => p.name).sort(),
+    promptList.result.prompts.map((p) => p.name).sort(),
+    "the discovery document must advertise precisely the prompts the server serves",
+  );
+
+  // The install block is the point of the document for a human reader: an
+  // endpoint nobody can find is the failure this replaced.
+  assert.match(discovery.install.claudeCode.command, /^claude mcp add --transport http /);
+  assert.ok(discovery.install.claudeConnector.url.endsWith("/api/mcp"));
+  assert.equal(discovery.install.claudeConnector.authentication, "none");
 
   const llms = await fetch(`${BASE}/llms.txt`);
   assert.equal(llms.status, 200);
   assert.match(llms.headers.get("content-type") ?? "", /text\/plain/);
+  const llmsBody = await llms.text();
+  for (const name of live) {
+    assert.ok(llmsBody.includes(name), `${name} must appear in llms.txt`);
+  }
 
   const openapi = await fetch(`${BASE}/api/openapi.json`);
   assert.equal(openapi.status, 200);
   const spec = await openapi.json();
   assert.ok(spec.openapi?.startsWith("3."), "must be an OpenAPI 3.x document");
+});
+
+/* --------------------------------------------------------------- prompts */
+
+test("prompts are advertised as a capability, not just answered", async () => {
+  const { body } = await rpc("initialize", { protocolVersion: "2025-06-18" });
+  assert.ok(
+    body.result.capabilities.prompts,
+    "a client that does not see the capability never calls prompts/list",
+  );
+});
+
+test("every prompt lists and builds with its required arguments supplied", async () => {
+  const { body } = await rpc("prompts/list");
+  const prompts = body.result.prompts;
+  assert.ok(prompts.length >= 3, `expected at least 3 prompts, got ${prompts.length}`);
+
+  // Plausible values for anything a prompt marks required. A prompt that adds a
+  // new required argument fails here until it is given one, which is the point.
+  const sample = {
+    place: "Japan",
+    criteria: "developers in Japan",
+    logins: "felixonmars, steipete",
+    login: "felixonmars",
+  };
+
+  for (const prompt of prompts) {
+    assert.ok(prompt.title, `${prompt.name} needs a title — it is the clickable label`);
+    assert.ok(prompt.description.length > 40, `${prompt.name} needs a real description`);
+
+    const args = {};
+    for (const argument of prompt.arguments ?? []) {
+      assert.ok(argument.description, `${prompt.name}.${argument.name} needs a description`);
+      if (!argument.required) continue;
+      assert.ok(
+        argument.name in sample,
+        `${prompt.name} requires "${argument.name}" — add a sample value to this test`,
+      );
+      args[argument.name] = sample[argument.name];
+    }
+
+    const { body: got } = await rpc("prompts/get", { name: prompt.name, arguments: args });
+    assert.ok(got.result, `${prompt.name} failed: ${JSON.stringify(got.error)}`);
+
+    const messages = got.result.messages;
+    assert.equal(messages.length, 1);
+    assert.equal(messages[0].role, "user", "a prompt must not fabricate an assistant turn");
+    assert.ok(messages[0].content.text.length > 100, `${prompt.name} produced a thin message`);
+    assert.match(
+      messages[0].content.text,
+      /commitgraph_/,
+      `${prompt.name} must name the tools it expects to be called`,
+    );
+  }
+});
+
+test("a prompt missing a required argument is rejected, not silently rendered", async () => {
+  const { body } = await rpc("prompts/get", { name: "commitgraph_place_report", arguments: {} });
+  assert.equal(body.error.code, -32602);
+  assert.match(body.error.message, /place/);
+});
+
+test("an unknown prompt names the recovery path", async () => {
+  const { body } = await rpc("prompts/get", { name: "commitgraph_nope", arguments: {} });
+  assert.equal(body.error.code, -32002);
+  assert.match(body.error.message, /prompts\/list/);
+});
+
+test("the install page states the endpoint a client is meant to be given", async () => {
+  const response = await fetch(`${BASE}/connect`);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /api\/mcp/, "the connect page must print the endpoint");
+  assert.match(html, /claude mcp add --transport http/, "…and the Claude Code command");
+});
+
+test("every tool carries the annotations the connector directory requires", async () => {
+  const { body } = await rpc("tools/list");
+
+  for (const tool of body.result.tools) {
+    // "All tools must include a `title` and the applicable `readOnlyHint` or
+    // `destructiveHint`." A listing missing these is rejected before a reviewer
+    // looks at what the tools actually do.
+    assert.ok(tool.title, `${tool.name} needs a title`);
+    assert.ok(tool.annotations, `${tool.name} needs annotations`);
+    assert.equal(tool.annotations.title, tool.title);
+    assert.equal(
+      typeof tool.annotations.readOnlyHint,
+      "boolean",
+      `${tool.name} must declare readOnlyHint`,
+    );
+    assert.notEqual(
+      tool.annotations.readOnlyHint,
+      tool.annotations.destructiveHint,
+      `${tool.name} cannot be both read-only and destructive`,
+    );
+
+    // This server serves a committed snapshot and has no write path, so a
+    // destructive tool here means someone added a capability without revisiting
+    // the safety story.
+    assert.equal(tool.annotations.readOnlyHint, true, `${tool.name} must be read-only`);
+    assert.equal(tool.annotations.openWorldHint, false, `${tool.name} reads a closed corpus`);
+
+    assert.ok(tool.name.length <= 64, `${tool.name} exceeds the 64-character limit`);
+  }
 });

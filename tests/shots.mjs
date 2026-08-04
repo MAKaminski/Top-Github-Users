@@ -28,6 +28,7 @@ const ROUTES = [
   ["repos", "/repos"],
   ["profile", "/u/felixonmars"],
   ["methodology", "/methodology"],
+  ["connect", "/connect"],
 ];
 
 const failures = [];
@@ -41,14 +42,41 @@ async function shoot(browser, { name, path, width, height, reduced, js = true, f
   });
   const page = await context.newPage();
 
+  /**
+   * Serve avatars locally instead of fetching them.
+   *
+   * This sweep exists to judge our own markup under reduced motion and with
+   * scripting off. Avatars are the one thing on these pages that comes from
+   * somebody else's host, and reaching for them makes the run depend on a
+   * third party that has nothing to do with what is being tested.
+   *
+   * With JavaScript disabled the dependency turns fatal rather than merely
+   * slow: nothing defers the images, so a full leaderboard asks the CDN for
+   * roughly 2,500 files at once. Behind this sandbox's proxy that backs up far
+   * enough that `document.fonts.ready` never settles, and `page.screenshot()`
+   * — which waits on it — times out. Blocking the host takes the same frame in
+   * about 200ms.
+   *
+   * Fulfilled with a transparent pixel rather than aborted, so every <img> still
+   * occupies its box and the layout being judged is the real one.
+   */
+  await page.route("**://avatars.githubusercontent.com/**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "image/gif",
+      // 1×1 transparent GIF.
+      body: Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64"),
+    }),
+  );
+
   const errors = [];
   page.on("pageerror", (error) => errors.push(String(error)));
   page.on("console", (message) => {
     if (message.type() !== "error") return;
     const text = message.text();
-    // Avatars come from an external CDN. Under the parallel load of this sweep
-    // the sandbox proxy resets some of those connections; that is an
-    // environment artefact, not a defect in the page.
+    // Kept even though avatars no longer leave the machine: any other resource
+    // this sandbox's proxy resets is still an environment artefact, not a page
+    // defect.
     if (/ERR_CONNECTION_RESET|ERR_NETWORK_CHANGED|Failed to load resource/.test(text)) return;
     errors.push(text);
   });

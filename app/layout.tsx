@@ -9,6 +9,8 @@ import { NumericPreloader, BootAnnouncer } from "@/components/patterns/numeric-p
 import { SiteBackground } from "@/components/background";
 import { SiteFooter } from "@/components/site-footer";
 import { getManifest, getWorldwide } from "@/lib/data";
+import { REPO_SLUG, SITE_URL } from "@/lib/site";
+import { StructuredData } from "@/components/structured-data";
 
 const grotesk = Inter({
   subsets: ["latin"],
@@ -25,17 +27,50 @@ const mono = JetBrains_Mono({
   preload: true,
 });
 
+const DESCRIPTION =
+  "Worldwide, country and city leaderboards of the most active developers on GitHub, with contribution heatmaps, rank movement and the charts every other ranking site leaves out.";
+
 export const metadata: Metadata = {
+  /**
+   * Without this, Next resolves Open Graph and canonical URLs relatively, which
+   * means a crawler or a social card renderer receives a path with no origin
+   * and silently drops it. It is the single highest-value line in this object.
+   */
+  metadataBase: new URL(SITE_URL),
   title: {
     default: "Commitgraph — the most active developers on GitHub",
     template: "%s · Commitgraph",
   },
-  description:
-    "Worldwide, country and city leaderboards of the most active developers on GitHub, with contribution heatmaps, rank movement and the charts every other ranking site leaves out.",
+  description: DESCRIPTION,
+  applicationName: "Commitgraph",
+  keywords: [
+    "GitHub leaderboard",
+    "most active GitHub developers",
+    "GitHub contributions ranking",
+    "top developers by country",
+    "open source contributors",
+    "MCP server",
+    "Claude connector",
+  ],
+  authors: [{ name: "Michael Kaminski", url: `https://github.com/${REPO_SLUG.split("/")[0]}` }],
+  creator: "Michael Kaminski",
   openGraph: {
-    title: "Commitgraph",
-    description: "The most active developers on GitHub, visualised properly.",
+    title: "Commitgraph — the most active developers on GitHub",
+    description: DESCRIPTION,
     type: "website",
+    siteName: "Commitgraph",
+    url: SITE_URL,
+    locale: "en_US",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Commitgraph — the most active developers on GitHub",
+    description: "The most active developers on GitHub, visualised properly.",
+  },
+  robots: {
+    index: true,
+    follow: true,
+    googleBot: { index: true, follow: true, "max-image-preview": "large", "max-snippet": -1 },
   },
 };
 
@@ -56,6 +91,7 @@ export default async function RootLayout({ children }: { children: React.ReactNo
   return (
     <html lang="en" className={`${grotesk.variable} ${mono.variable}`}>
       <body>
+        <StructuredData manifest={manifest} />
         <SiteBackground seed={seed} />
         <NumericPreloader />
         <CurtainRouteTransition />
