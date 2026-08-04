@@ -81,10 +81,38 @@ export const DEMO_CLIP = {
  */
 export const PRODUCT_HUNT: {
   url: string;
-  postId: string | null;
+  productId: string;
+  badge: {
+    href: string;
+    theme: "light" | "dark" | "neutral";
+    width: number;
+    height: number;
+  };
 } | null = {
   url: "https://www.producthunt.com/products/commitgraph",
-  postId: null,
+  // This listing is a *product*, not a launch post, so the badge endpoint is
+  // `product_review.svg` and the parameter is `product_id` — `post_id` belongs
+  // to the `featured.svg` badge and returns nothing here.
+  productId: "1284629",
+  badge: {
+    /**
+     * Product Hunt's own generated href, reproduced verbatim — including the
+     * `utm_source` that appears twice in their snippet. It is theirs, it is what
+     * their attribution reads, and tidying somebody else's tracking parameters
+     * is how a launch quietly stops being credited.
+     */
+    href: "https://www.producthunt.com/products/commitgraph/reviews/new?utm_source=badge-product_review&utm_medium=badge&utm_source=badge-commitgraph",
+    /**
+     * The snippet from Product Hunt defaults to `light`, which is a white badge
+     * intended for a light page. This footer is always near-black — the
+     * `data-theme="light"` flip only applies to scroll-inverted sections, never
+     * here — so the light badge lands as a white sticker. `dark` is Product
+     * Hunt's own treatment for exactly this case. One word to change back.
+     */
+    theme: "dark",
+    width: 250,
+    height: 54,
+  },
 };
 
 /** Named once so the /connect page, the discovery document and the README

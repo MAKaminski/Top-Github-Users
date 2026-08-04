@@ -146,7 +146,7 @@ test("the self-hosted demo clip and its poster are actually committed", () => {
   }
 });
 
-test("the Product Hunt link is either absent or usable", () => {
+test("the Product Hunt badge is either absent or fully configured", () => {
   if (PRODUCT_HUNT === null) return;
 
   assert.match(
@@ -155,10 +155,21 @@ test("the Product Hunt link is either absent or usable", () => {
     "expected a canonical Product Hunt listing URL with no query string",
   );
 
-  // Optional, but when present it must be the numeric id the badge endpoint
-  // takes. A slug here renders Product Hunt's error art site-wide, because the
-  // footer is on every page.
-  if (PRODUCT_HUNT.postId !== null) {
-    assert.match(PRODUCT_HUNT.postId, /^\d+$/, "post_id is the numeric id, not the slug");
-  }
+  // The badge endpoint takes the numeric product id. A slug renders Product
+  // Hunt's error art, and the footer is on every one of the site's pages.
+  assert.match(PRODUCT_HUNT.productId, /^\d+$/, "product_id is numeric");
+
+  assert.ok(
+    PRODUCT_HUNT.badge.href.startsWith(`${PRODUCT_HUNT.url}/`),
+    "the badge must link inside the listing it advertises",
+  );
+
+  // The footer is always near-black; the scroll-inversion flip never reaches
+  // it. A light badge there is a white sticker.
+  assert.equal(PRODUCT_HUNT.badge.theme, "dark", "the footer never renders light");
+
+  // Product Hunt serves the badge at exactly this size. Declaring anything else
+  // reserves the wrong box and shifts the footer when the image lands.
+  assert.equal(PRODUCT_HUNT.badge.width, 250);
+  assert.equal(PRODUCT_HUNT.badge.height, 54);
 });
