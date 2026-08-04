@@ -47,6 +47,41 @@ export const DEMO_VIDEO: {
   durationLabel: string;
 } | null = null;
 
+/**
+ * The self-hosted screen capture, shown while `DEMO_VIDEO` is null.
+ *
+ * This is `scripts/capture-demo.mjs` output: a silent pass over /connect, no
+ * narration and no claude.ai footage, because that segment needs a signed-in
+ * account. It is honest B-roll, not a tutorial, and the caption on the page
+ * says so — a silent clip presented as "the walkthrough" would send people
+ * looking for instructions that are not in it.
+ *
+ * The YouTube cut supersedes it: set DEMO_VIDEO and the page swaps the inline
+ * player for the link card automatically.
+ */
+export const DEMO_CLIP = {
+  src: "/demo/connect-walkthrough.webm",
+  poster: "/demo/connect-walkthrough-poster.jpg",
+  durationSeconds: 30,
+} as const;
+
+/**
+ * Product Hunt listing, or null before launch.
+ *
+ * `postId` is the numeric id the official badge endpoint takes — not the slug.
+ * Find it in the embed snippet on the launch page: the badge `<img>` src ends
+ * in `?post_id=<id>`. Both are needed: the id renders the badge, the slug is
+ * the human link.
+ *
+ * Null until launch for the same reason DEMO_VIDEO is: a badge pointing at a
+ * post that does not exist yet renders Product Hunt's own error art in the
+ * footer of every page on the site.
+ */
+export const PRODUCT_HUNT: {
+  postId: string;
+  slug: string;
+} | null = null;
+
 /** Named once so the /connect page, the discovery document and the README
  *  cannot drift from each other. */
 export const INSTALL_COMMANDS = {

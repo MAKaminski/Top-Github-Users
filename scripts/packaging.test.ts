@@ -17,9 +17,17 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { DEMO_VIDEO, MARKETPLACE_NAME, MCP_URL, PLUGIN_NAME, SITE_URL } from "../lib/site.ts";
+import {
+  DEMO_CLIP,
+  DEMO_VIDEO,
+  MARKETPLACE_NAME,
+  MCP_URL,
+  PLUGIN_NAME,
+  PRODUCT_HUNT,
+  SITE_URL,
+} from "../lib/site.ts";
 
 const root = join(import.meta.dirname, "..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -125,4 +133,25 @@ test("the walkthrough video is either absent or a real published URL", () => {
   );
   assert.ok(DEMO_VIDEO.title.length > 8, "the card needs a real title");
   assert.match(DEMO_VIDEO.durationLabel, /^\d+:\d{2}$/, "duration reads as m:ss");
+});
+
+test("the self-hosted demo clip and its poster are actually committed", () => {
+  // The <video> is server-rendered with no fallback, so a missing file is a
+  // broken player on the page a new user is most likely to land on.
+  for (const asset of [DEMO_CLIP.src, DEMO_CLIP.poster]) {
+    assert.ok(asset.startsWith("/"), `${asset} must be a root-relative public path`);
+    const onDisk = join(root, "public", asset.slice(1));
+    assert.ok(existsSync(onDisk), `${asset} is referenced but not in public/`);
+    assert.ok(statSync(onDisk).size > 1024, `${asset} is present but suspiciously small`);
+  }
+});
+
+test("the Product Hunt badge is either absent or fully configured", () => {
+  // Both fields or neither. The badge endpoint takes the numeric post_id, and
+  // the human link takes the slug — shipping one without the other renders
+  // Product Hunt's error art in the footer of every page.
+  if (PRODUCT_HUNT === null) return;
+
+  assert.match(PRODUCT_HUNT.postId, /^\d+$/, "post_id is the numeric id, not the slug");
+  assert.match(PRODUCT_HUNT.slug, /^[a-z0-9-]+$/, "slug is the kebab-case URL segment");
 });

@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { ScrollVelocityMarquee } from "./patterns/scroll-velocity-marquee";
 import { NAV_LINKS } from "@/components/nav-links";
+import { PRODUCT_HUNT } from "@/lib/site";
 import { exact } from "@/lib/format";
 import type { LeaderboardEntry, Manifest } from "@/lib/types";
 
@@ -20,7 +21,7 @@ export function SiteFooter({
       />
 
       <div className="shell grid gap-[var(--space-lg)] py-[var(--space-lg)] md:grid-cols-[2fr_1fr_1fr]">
-        <div className="flex flex-col gap-[var(--space-xs)]">
+        <div className="flex flex-col items-start gap-[var(--space-xs)]">
           <p className="mono text-caption uppercase tracking-[var(--tracking-caption)]">
             Commitgraph
           </p>
@@ -28,6 +29,37 @@ export function SiteFooter({
             {exact(manifest.counts.users)} developers across {manifest.counts.countries} countries
             and {manifest.counts.cities} cities. Snapshot {manifest.generatedAt}.
           </p>
+
+          {/*
+            Product Hunt's own badge, rendered only once PRODUCT_HUNT is set.
+
+            A plain <img> rather than next/image: the badge is served by Product
+            Hunt and carries a live upvote count, so routing it through the
+            image optimiser would cache a number that is meant to move, and
+            would need their host added to remotePatterns for one 250px asset.
+
+            `theme=neutral` reads against both the dark and light states this
+            site switches between; the light-only badge vanishes into the
+            footer on the dark theme.
+          */}
+          {PRODUCT_HUNT ? (
+            <a
+              href={`https://www.producthunt.com/posts/${PRODUCT_HUNT.slug}?embed=true&utm_source=badge-featured&utm_medium=badge`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-[var(--space-2xs)] inline-block"
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={`https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=${PRODUCT_HUNT.postId}&theme=neutral`}
+                alt="Commitgraph on Product Hunt"
+                width={250}
+                height={54}
+                loading="lazy"
+                decoding="async"
+              />
+            </a>
+          ) : null}
         </div>
 
         <nav aria-label="Footer">

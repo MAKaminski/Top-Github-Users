@@ -7,6 +7,7 @@ import { getManifest, getWorldwide } from "@/lib/data";
 import { exact } from "@/lib/format";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/leaderboard" },
   title: "Worldwide leaderboard",
   description: "The most active developers on GitHub worldwide, ranked by contributions.",
 };

@@ -24,6 +24,7 @@ export async function generateMetadata({
   const place = manifest.countries.find((p) => p.id === id);
   if (!place) return {};
   return {
+    alternates: { canonical: `/countries/${id}` },
     title: `${place.name} leaderboard`,
     description: `The most active GitHub developers in ${place.name}.`,
   };

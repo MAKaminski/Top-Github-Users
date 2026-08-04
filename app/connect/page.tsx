@@ -4,9 +4,17 @@ import { PROMPTS } from "@/lib/mcp/prompts";
 import { TOOLS } from "@/lib/mcp/tools";
 import { getManifest } from "@/lib/data";
 import { exact } from "@/lib/format";
-import { DEMO_VIDEO, INSTALL_COMMANDS, MCP_URL, REPO_SLUG, SITE_URL } from "@/lib/site";
+import {
+  DEMO_CLIP,
+  DEMO_VIDEO,
+  INSTALL_COMMANDS,
+  MCP_URL,
+  REPO_SLUG,
+  SITE_URL,
+} from "@/lib/site";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/connect" },
   title: "Connect",
   description:
     "Add Commitgraph to Claude as a connector, or install it as a Claude Code plugin. Public, " +
@@ -75,10 +83,13 @@ export default async function ConnectPage() {
           <Command>{MCP_URL}</Command>
         </div>
 
-        {/* Rendered only once a video exists — see DEMO_VIDEO in lib/site.ts.
-            A link out rather than an embedded player: an iframe would load
-            YouTube on every view of this page, for a video most readers will
-            not watch, and the steps below are the faster path anyway. */}
+        {/* Two states, never both. Once the narrated cut is published,
+            DEMO_VIDEO takes over and the silent local clip stops rendering —
+            a page offering two versions of the same walkthrough makes the
+            reader choose, and one of the choices is worse.
+
+            A link out rather than an embedded iframe: YouTube would load on
+            every view of this page for a video most readers will not open. */}
         {DEMO_VIDEO ? (
           <a
             href={DEMO_VIDEO.url}
@@ -97,7 +108,33 @@ export default async function ConnectPage() {
               </span>
             </span>
           </a>
-        ) : null}
+        ) : (
+          <figure className="mt-[var(--space-md)] max-w-[52rem]">
+            {/*
+              No autoplay and no loop. This sits directly under the endpoint a
+              reader came here to copy, and a moving picture beside text people
+              are trying to read is a cost with no matching benefit. `controls`
+              also means it behaves the same with JavaScript off, which every
+              route here is required to.
+            */}
+            <video
+              className="w-full border border-rule"
+              src={DEMO_CLIP.src}
+              poster={DEMO_CLIP.poster}
+              controls
+              muted
+              playsInline
+              preload="none"
+              width={1280}
+              height={720}
+            />
+            <figcaption className="mt-[var(--space-2xs)] text-caption text-muted">
+              A silent {DEMO_CLIP.durationSeconds}-second capture of this page. The narrated
+              walkthrough, including the Claude connector screens, is not published yet — the
+              numbered steps below are complete on their own.
+            </figcaption>
+          </figure>
+        )}
       </section>
 
       <div
