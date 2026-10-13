@@ -74,6 +74,7 @@ export function HoverPreviewIndex({ entries }: { entries: LeaderboardEntry[] }) 
             <li key={entry.login}>
               <Link
                 href={href}
+                prefetch={false}
                 {...(external ? { target: "_blank", rel: "noreferrer noopener" } : {})}
                 data-cursor={external ? "GITHUB" : "PROFILE"}
                 onPointerEnter={() => show(entry)}

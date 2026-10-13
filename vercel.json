@@ -9,7 +9,8 @@
       "headers": [
         { "key": "access-control-allow-origin", "value": "*" },
         { "key": "access-control-allow-methods", "value": "GET, OPTIONS" },
-        { "key": "access-control-allow-headers", "value": "content-type" }
+        { "key": "access-control-allow-headers", "value": "content-type" },
+        { "key": "access-control-max-age", "value": "86400" }
       ]
     }
   ]

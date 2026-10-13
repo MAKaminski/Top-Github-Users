@@ -28,6 +28,7 @@ export default async function CountriesPage() {
             <li key={place.id}>
               <Link
                 href={`/countries/${place.id}`}
+                prefetch={false}
                 data-cursor="OPEN"
                 className="grid grid-cols-[3.5ch_1fr_auto_auto] items-center gap-[var(--space-sm)] border-b border-rule py-[var(--space-xs)] transition-colors hover:bg-surface"
               >

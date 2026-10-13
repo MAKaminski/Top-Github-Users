@@ -145,6 +145,7 @@ export default async function HomePage() {
             <li key={place.id} className="col-span-2 lg:col-span-3">
               <Link
                 href={`/countries/${place.id}`}
+                prefetch={false}
                 data-cursor="OPEN"
                 className="flex flex-col gap-1 border-t border-rule pt-[var(--space-2xs)] transition-colors hover:border-ink"
               >

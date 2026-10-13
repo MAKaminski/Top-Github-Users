@@ -14,6 +14,10 @@ const ROWS = 16;
  * intensity mapped to contributions. Deliberately not a true choropleth: on a
  * geographic map Russia and Canada dominate the frame regardless of what the
  * data says, which is the classic way this chart lies.
+ *
+ * The tiles do not prefetch: the whole map is in the viewport at once, so the
+ * default would pull all ~90 country payloads (each ~30 KB compressed) from
+ * origin on every visit that misses the CDN cache.
  */
 export function TileGridMap({ places }: { places: Place[] }) {
   const withIso = places.filter((place) => place.iso2);
@@ -47,6 +51,7 @@ export function TileGridMap({ places }: { places: Place[] }) {
             <Link
               key={cell.iso2}
               href={`/countries/${place.id}`}
+              prefetch={false}
               data-cursor={place.iso2 ?? undefined}
               title={`${place.name} — ${exact(place.totalContributions)} contributions`}
               className="group relative block outline-offset-2"
