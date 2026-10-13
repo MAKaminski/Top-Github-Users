@@ -13,6 +13,18 @@ import { calendarFor, monthlyFrom, streaksFrom } from "@/lib/calendar";
 import { flagOf } from "@/scripts-shared/flags";
 import { abbreviate, exact, pseudoHash, rankLabel } from "@/lib/format";
 
+/**
+ * Every valid profile is enumerated by generateStaticParams from the committed
+ * snapshot, and the snapshot only changes through a commit, which rebuilds the
+ * site. Anything else is a 404, so serve the static not-found page instead of
+ * invoking a function to render one on demand for every guessed URL.
+ *
+ * No `revalidate` on purpose: the data on disk cannot change without a new
+ * deployment, so a time-based revalidation would only re-render identical
+ * pages and push them through the ISR cache again.
+ */
+export const dynamicParams = false;
+
 export async function generateStaticParams() {
   const logins = await getProfileLogins();
   return logins.map((login) => ({ login }));
