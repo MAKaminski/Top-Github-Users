@@ -9,6 +9,12 @@ import type { LeaderboardEntry } from "@/lib/types";
  *
  * A server component with no motion: it must render, and be readable, with
  * JavaScript disabled. Every number is in the DOM as text.
+ *
+ * `prefetch={false}`: these rows come in lists of up to 500, and next/link
+ * prefetches every in-viewport link's RSC payload. On a static site that is
+ * one origin fetch per row per CDN region whenever the payload is not already
+ * cached there — the dominant source of Fast Origin Transfer here. Navigation
+ * still happens client-side; the payload is fetched on click instead.
  */
 export function LeaderboardRow({ entry }: { entry: LeaderboardEntry }) {
   const href = entry.hasProfile ? `/u/${entry.login}` : `https://github.com/${entry.login}`;
@@ -19,6 +25,7 @@ export function LeaderboardRow({ entry }: { entry: LeaderboardEntry }) {
   return (
     <Link
       href={href}
+      prefetch={false}
       {...(external ? { target: "_blank", rel: "noreferrer noopener" } : {})}
       data-cursor={external ? "GITHUB" : "PROFILE"}
       className="grid grid-cols-[3.5ch_1fr_auto] items-center gap-[var(--space-sm)] border-b border-rule py-[var(--space-xs)] transition-colors hover:bg-surface md:grid-cols-[3.5ch_2.5rem_1fr_7rem_7rem_5.5rem] md:gap-[var(--space-md)]"
