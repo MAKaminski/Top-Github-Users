@@ -9,6 +9,18 @@ import { getCountryBoard, getManifest } from "@/lib/data";
 import { flagOf } from "@/scripts-shared/flags";
 import { abbreviate, exact } from "@/lib/format";
 
+/**
+ * Every valid country is enumerated by generateStaticParams from the committed
+ * snapshot, and the snapshot only changes through a commit, which rebuilds the
+ * site. Anything else is a 404, so serve the static not-found page instead of
+ * invoking a function to render one on demand for every guessed URL.
+ *
+ * No `revalidate` on purpose: the data on disk cannot change without a new
+ * deployment, so a time-based revalidation would only re-render identical
+ * pages and push them through the ISR cache again.
+ */
+export const dynamicParams = false;
+
 export async function generateStaticParams() {
   const manifest = await getManifest();
   return manifest.countries.map((place) => ({ id: place.id }));
@@ -77,6 +89,7 @@ export default async function CountryPage({ params }: { params: Promise<{ id: st
               <li key={city.id}>
                 <Link
                   href={`/cities/${city.id}`}
+                  prefetch={false}
                   className="mono block border border-rule px-[var(--space-xs)] py-1 text-caption transition-colors hover:border-ink"
                 >
                   {city.name} · {city.userCount}

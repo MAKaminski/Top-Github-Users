@@ -34,6 +34,7 @@ export default async function CitiesPage() {
           <Link
             key={city.id}
             href={`/cities/${city.id}`}
+            prefetch={false}
             data-cursor="OPEN"
             className="flex h-full flex-col justify-between gap-[var(--space-sm)] border border-rule p-[var(--space-sm)] transition-colors hover:border-ink"
           >
