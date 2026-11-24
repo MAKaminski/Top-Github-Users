@@ -12,4 +12,5 @@ export const NAV_LINKS = [
   { href: "/cities", label: "Cities" },
   { href: "/orgs", label: "Organizations" },
   { href: "/methodology", label: "Methodology" },
+  { href: "/connect", label: "Connect" },
 ] as const;

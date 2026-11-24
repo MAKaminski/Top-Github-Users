@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "commitgraph",
+  "description": "Rankings of the most active developers on GitHub, packaged for Claude.",
+  "owner": {
+    "name": "Michael Kaminski",
+    "url": "https://github.com/MAKaminski"
+  },
+  "plugins": [
+    {
+      "name": "commitgraph",
+      "displayName": "Commitgraph",
+      "source": "./plugins/commitgraph",
+      "description": "Ask Claude about the most active developers on GitHub — worldwide, and by country and city — with contribution calendars, streaks, employers and distributions. Read-only over a committed public snapshot.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Michael Kaminski",
+        "url": "https://github.com/MAKaminski"
+      },
+      "homepage": "https://top-github-users-amber.vercel.app/connect",
+      "repository": "https://github.com/MAKaminski/Top-Github-Users",
+      "category": "data",
+      "keywords": ["github", "developers", "leaderboard", "rankings", "open-source", "mcp"],
+      "tags": ["github", "analytics", "public-data"]
+    }
+  ]
+}

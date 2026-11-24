@@ -6,6 +6,7 @@ import { flagOf } from "@/scripts-shared/flags";
 import { abbreviate, exact, rankLabel } from "@/lib/format";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/cities" },
   title: "Cities",
   description: "GitHub contribution leaderboards for every tracked city.",
 };
@@ -34,6 +35,7 @@ export default async function CitiesPage() {
           <Link
             key={city.id}
             href={`/cities/${city.id}`}
+            prefetch={false}
             data-cursor="OPEN"
             className="flex h-full flex-col justify-between gap-[var(--space-sm)] border border-rule p-[var(--space-sm)] transition-colors hover:border-ink"
           >

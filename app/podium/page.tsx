@@ -10,6 +10,7 @@ import { calendarFor, streaksFrom } from "@/lib/calendar";
 import { abbreviate, exact, rankLabel } from "@/lib/format";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/podium" },
   title: "The top ten",
   description: "A panel-by-panel walk through the ten most active developers on GitHub.",
 };

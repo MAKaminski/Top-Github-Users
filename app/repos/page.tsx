@@ -5,6 +5,7 @@ import { getRepositories } from "@/lib/data";
 import { abbreviate, rankLabel } from "@/lib/format";
 
 export const metadata: Metadata = {
+  alternates: { canonical: "/repos" },
   title: "Repositories",
   description: "The most starred repositories tracked by Commitgraph.",
 };

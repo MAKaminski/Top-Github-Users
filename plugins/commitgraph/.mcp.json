@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "commitgraph": {
+      "type": "http",
+      "url": "${COMMITGRAPH_MCP_URL:-https://top-github-users-amber.vercel.app/api/mcp}"
+    }
+  }
+}
