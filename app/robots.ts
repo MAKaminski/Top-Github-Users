@@ -38,7 +38,11 @@ export default function robots(): MetadataRoute.Robots {
   return {
     rules: [
       { userAgent: "*", allow: "/", disallow: ["/api/"] },
-      { userAgent: assistantCrawlers, allow: "/", disallow: ["/api/"] },
+      // The ~7,000 long-tail pages are denied to these agents at the edge
+      // (vercel.json routes): crawling them was most of the project's ISR reads
+      // and origin transfer. The same data is one request away over MCP, the
+      // REST mirror and llms.txt, which is where a model should read it.
+      { userAgent: assistantCrawlers, allow: "/", disallow: ["/api/", "/u/", "/cities/", "/countries/"] },
     ],
     sitemap: `${SITE_URL}/sitemap.xml`,
     host: SITE_URL,
