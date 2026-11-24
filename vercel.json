@@ -3,6 +3,19 @@
   "framework": "nextjs",
   "installCommand": "pnpm install --frozen-lockfile",
   "buildCommand": "pnpm build",
+  "routes": [
+    {
+      "src": "/(u|cities|countries)/.+",
+      "has": [
+        {
+          "type": "header",
+          "key": "user-agent",
+          "value": { "re": "(GPTBot|OAI-SearchBot|ClaudeBot|Claude-Web|anthropic-ai|PerplexityBot|CCBot|Bytespider|Amazonbot|meta-externalagent|Applebot-Extended|ImagesiftBot|DataForSeoBot|SemrushBot|AhrefsBot|MJ12bot|DotBot|PetalBot)" }
+        }
+      ],
+      "mitigate": { "action": "deny" }
+    }
+  ],
   "headers": [
     {
       "source": "/api/(.*)",
