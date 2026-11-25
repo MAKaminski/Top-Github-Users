@@ -4,7 +4,8 @@ name: crawl
 # different amounts of rate limit. The worldwide board and the largest countries
 # earn a daily pass; the long tail of countries a weekly sweep, split into
 # alphabetical shards so one failing range does not lose the others; cities a
-# monthly one; organisations and repositories weekly.
+# monthly one; everything else weekly (the daily and 6-hourly runs were retired
+# to stop a commit, and a Vercel build, on every pass).
 #
 # `github.event.schedule` is how one workflow tells its own crons apart — the
 # alternative is four near-identical files that drift out of step.
@@ -13,8 +14,8 @@ on:
   schedule:
     # Off the hour: everything else in the world is scheduled on it, and GitHub
     # queues scheduled runs accordingly.
-    - cron: "5 */6 * * *" # 6-hourly — GH Archive discovery (no API budget)
-    - cron: "17 3 * * *" # daily   — worldwide + the largest countries
+    - cron: "5 2 * * 0" # weekly  — GH Archive discovery (no API budget)
+    - cron: "17 3 * * 0" # weekly  — worldwide + the largest countries
     - cron: "43 4 * * 0" # weekly  — remaining countries, organisations, repositories
     - cron: "11 5 1 * *" # monthly — cities
   workflow_dispatch:
@@ -61,7 +62,7 @@ jobs:
   # crawl secret is missing, which is exactly when knowing the candidate set is
   # most useful.
   discover:
-    if: github.event.schedule == '5 */6 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'discover')
+    if: github.event.schedule == '5 2 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'discover')
     name: discover
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -82,7 +83,7 @@ jobs:
 
   worldwide:
     needs: token
-    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'worldwide')
+    if: github.event.schedule == '17 3 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'worldwide')
     name: worldwide
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -105,7 +106,7 @@ jobs:
 
   countries_daily:
     needs: token
-    if: github.event.schedule == '17 3 * * *' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'countries' && inputs.shard == '')
+    if: github.event.schedule == '17 3 * * 0' || (github.event_name == 'workflow_dispatch' && inputs.tier == 'countries' && inputs.shard == '')
     name: countries (daily set)
     runs-on: ubuntu-latest
     timeout-minutes: 180
